@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"localstream/internal/indexer"
+	"localstream/internal/live"
 	"localstream/internal/media"
 	"localstream/internal/player"
 	"localstream/internal/store"
@@ -23,6 +24,10 @@ func main() {
 		err = demo(os.Args[2:])
 	case "read":
 		err = read(os.Args[2:])
+	case "live":
+		err = publishLive(os.Args[2:])
+	case "read-live":
+		err = readLive(os.Args[2:])
 	default:
 		usage()
 	}
@@ -33,8 +38,68 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|read-live [flags]")
 	os.Exit(2)
+}
+
+func publishLive(args []string) error {
+	fs := flag.NewFlagSet("live", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	segments := fs.Int("segments", 1, "segments to publish in this invocation")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	for range *segments {
+		index, err := publisher.PublishNext()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("published=%s segment=%d window=[%d,%d)\n", index.ID, publisher.NextSegment()-1, index.WindowStart, index.Timeline)
+	}
+	return nil
+}
+
+func readLive(args []string) error {
+	fs := flag.NewFlagSet("read-live", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	variant := fs.String("variant", "base", "initial variant")
+	start := fs.Int64("start-pts", -1, "segment boundary PTS in the current window")
+	switchTo := fs.String("switch-to", "sharp", "variant after the first segment")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	p, index, err := player.OpenStream(store.Open(*root), *stream, *variant)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+	if *start >= 0 {
+		if err := p.JumpTo(uint64(*start)); err != nil {
+			return err
+		}
+	}
+	first := true
+	for !p.AtEnd() {
+		if first && *switchTo != "" && *variant != *switchTo {
+			if err := p.Switch(*switchTo); err != nil {
+				return err
+			}
+		}
+		header, _, err := p.ReadSegment()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("publication=%s variant=%s segment=[%d,%d)\n", index.ID, p.Variant(), header.StartPTS, header.StartPTS+header.Duration)
+		first = false
+	}
+	return nil
 }
 
 func demo(args []string) error {

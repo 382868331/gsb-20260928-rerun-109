@@ -2,6 +2,7 @@ package media
 
 import (
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -12,11 +13,24 @@ const (
 )
 
 func WriteCompleteSegment(path string, variant VariantSpec, segment int) error {
-	f, err := os.Create(path)
+	dir, name := filepath.Split(path)
+	temporary, err := os.CreateTemp(dir, "."+name+"-*.part")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if err := writeCompleteSegment(temporary, variant, segment); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryName, path)
+}
+
+func writeCompleteSegment(f *os.File, variant VariantSpec, segment int) error {
 	start := uint64(segment) * SegmentDuration
 	h := Header{
 		Width:     variant.Width,
@@ -56,5 +70,5 @@ func WriteCompleteSegment(path string, variant VariantSpec, segment int) error {
 	if _, err := f.Write([]byte{0}); err != nil {
 		return err
 	}
-	return f.Close()
+	return nil
 }
