@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 
 	"localstream/internal/indexer"
+	"localstream/internal/live"
 	"localstream/internal/media"
 	"localstream/internal/player"
 	"localstream/internal/store"
@@ -23,6 +25,10 @@ func main() {
 		err = demo(os.Args[2:])
 	case "read":
 		err = read(os.Args[2:])
+	case "publish-live":
+		err = publishLive(os.Args[2:])
+	case "read-live":
+		err = readLive(os.Args[2:])
 	default:
 		usage()
 	}
@@ -33,8 +39,82 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|publish-live|read-live [flags]")
 	os.Exit(2)
+}
+
+func publishLive(args []string) error {
+	fs := flag.NewFlagSet("publish-live", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "news", "live stream name")
+	window := fs.Int("window", 3, "retained live segments")
+	segments := fs.Int("segments", 6, "number of segments to publish")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	if err := publisher.RecoverInterruption(); err != nil {
+		return err
+	}
+	for range *segments {
+		manifest, err := publisher.PublishNext(media.Variants)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("published sequence=%d window=[%d,%d)\n", manifest.NextSequence-1, manifest.WindowStart, manifest.WindowEnd)
+	}
+	return nil
+}
+
+func readLive(args []string) error {
+	fs := flag.NewFlagSet("read-live", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "news", "live stream name")
+	window := fs.Int("window", 3, "configured live window size")
+	initial := fs.String("variant", "base", "initial variant")
+	switchAt := fs.Int("switch-segment", -1, "absolute sequence at which to switch")
+	switchTo := fs.String("switch-to", "sharp", "variant after switch")
+	jumpLive := fs.Bool("jump-live", false, "begin at the current live edge")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	p, err := live.OpenPlayer(publisher, *initial)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+	if *jumpLive {
+		if _, err := p.JumpToLive(); err != nil {
+			return err
+		}
+	}
+	manifest, err := publisher.Manifest()
+	if err != nil {
+		return err
+	}
+	for p.Sequence() < manifest.WindowEnd {
+		if p.Sequence() == *switchAt {
+			if err := p.Switch(*switchTo); err != nil {
+				return err
+			}
+		}
+		header, packets, err := p.ReadSegment()
+		if errors.Is(err, live.ErrWindowExpired) {
+			return fmt.Errorf("playback fell outside the live window; call Jump/JumpToLive or Stop: %w", err)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Printf("variant=%s sequence=%d pts=[%d,%d) video=%d audio=%d packets=%d\n", p.Variant(), p.Sequence()-1, header.StartPTS, header.StartPTS+uint64(header.Duration), header.VideoFrames, header.AudioFrames, len(packets))
+	}
+	return nil
 }
 
 func demo(args []string) error {
