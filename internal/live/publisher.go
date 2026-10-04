@@ -70,6 +70,9 @@ func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
 		p.nextSegment = int(index.Timeline / media.SegmentDuration)
 		p.nextSequence = latest + 1
 		p.latestID = p.VersionID(latest)
+		if note, err := s.ReadReleaseNote(p.latestID); err == nil {
+			p.corrections = note.Correction
+		}
 	}
 	return p, nil
 }
@@ -136,6 +139,21 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
+	note := p.buildPublicationNote(id, p.latestID, variants, store.ReleaseContent{
+		Variant:  "",
+		Segment:  segment,
+		StartPTS: uint64(segment) * media.SegmentDuration,
+		EndPTS:   uint64(segment+1) * media.SegmentDuration,
+	})
+	note.Kind = store.ReleasePublish
+	note.Correction = p.corrections
+	for i := range note.Changes {
+		note.Changes[i].AdoptedFrom = id
+	}
+	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
 	if err := p.store.Commit(id, index); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
@@ -157,7 +175,7 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 // generated, copied and verified for all variants before the new immutable
 // version replaces the current pointer; on any failure the previous version
 // stays fully intact and current.
-func (p *Publisher) Correct(segmentIndex int) (*store.Index, error) {
+func (p *Publisher) Correct(segmentIndex int, reasons ...string) (*store.Index, error) {
 	if p.latestID == "" {
 		return nil, fmt.Errorf("stream %s has no published version to correct", p.stream)
 	}
@@ -208,6 +226,26 @@ func (p *Publisher) Correct(segmentIndex int) (*store.Index, error) {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
+	reason := ""
+	if len(reasons) > 0 {
+		reason = reasons[0]
+	}
+	note := p.buildPublicationNote(id, latest.ID, variants, store.ReleaseContent{
+		Variant:      "",
+		Segment:      segmentIndex,
+		StartPTS:     uint64(segmentIndex) * media.SegmentDuration,
+		EndPTS:       uint64(segmentIndex+1) * media.SegmentDuration,
+		BeforeSHA256: "",
+		AfterSHA256:  "",
+	})
+	note.Kind = store.ReleaseCorrect
+	note.Reason = reason
+	note.Correction = correction
+	p.fillChangeChecksums(&note, latest, &index, segmentIndex, id)
+	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
 	if err := p.store.Commit(id, index); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
@@ -222,6 +260,288 @@ func (p *Publisher) Correct(segmentIndex int) (*store.Index, error) {
 		return nil, err
 	}
 	return p.store.ReadIndex(id)
+}
+
+// WithdrawCorrection reverses the most recent correction decision for a
+// segment by publishing a new immutable release whose segment content is
+// adopted from that correction's parent. Old releases remain untouched.
+func (p *Publisher) WithdrawCorrection(segmentIndex int, reasons ...string) (*store.Index, error) {
+	if p.latestID == "" {
+		return nil, fmt.Errorf("stream %s has no published version to withdraw from", p.stream)
+	}
+	current, err := p.store.ReadIndex(p.latestID)
+	if err != nil {
+		return nil, err
+	}
+	targetID, err := p.latestCorrectionID(segmentIndex)
+	if err != nil {
+		return nil, err
+	}
+	return p.withdrawID(current, segmentIndex, targetID, firstReason(reasons))
+}
+
+// Withdraw reverses a specific correction release. It is accepted only when
+// that release is still the latest correction decision for its segment.
+func (p *Publisher) Withdraw(correctionID string, reasons ...string) (*store.Index, error) {
+	if p.latestID == "" {
+		return nil, fmt.Errorf("stream %s has no published version to withdraw from", p.stream)
+	}
+	target, err := p.store.ReadReleaseNote(correctionID)
+	if err != nil {
+		return nil, err
+	}
+	if target.Kind != store.ReleaseCorrect || len(target.Changes) == 0 {
+		return nil, fmt.Errorf("release %s is not a correction", correctionID)
+	}
+	segmentIndex := target.Changes[0].Segment
+	latestCorrection, err := p.latestCorrectionID(segmentIndex)
+	if err != nil {
+		return nil, err
+	}
+	if latestCorrection != correctionID {
+		return nil, fmt.Errorf("correction %s for segment %d is superseded by %s", correctionID, segmentIndex, latestCorrection)
+	}
+	current, err := p.store.ReadIndex(p.latestID)
+	if err != nil {
+		return nil, err
+	}
+	return p.withdrawID(current, segmentIndex, correctionID, firstReason(reasons))
+}
+
+func (p *Publisher) withdrawID(current *store.Index, segmentIndex int, correctionID, reason string) (*store.Index, error) {
+	target, err := p.store.ReadReleaseNote(correctionID)
+	if err != nil {
+		return nil, err
+	}
+	if target.ParentID == "" {
+		return nil, fmt.Errorf("correction %s has no parent release", correctionID)
+	}
+	restored, err := p.store.ReadIndex(target.ParentID)
+	if err != nil {
+		return nil, err
+	}
+	id := p.VersionID(p.nextSequence)
+	if p.store.VersionExists(id) {
+		return nil, fmt.Errorf("publication %s already exists", id)
+	}
+	variants, changed := p.variantsWithReplacement(current, restored, segmentIndex)
+	if !changed {
+		return nil, fmt.Errorf("segment %d is unavailable in release %s", segmentIndex, correctionID)
+	}
+	if _, err := p.store.Prepare(id, variants, p.withdrawCopyCallback(segmentIndex, target.ParentID)); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	note := p.buildPublicationNote(id, current.ID, variants, store.ReleaseContent{
+		Variant:  "",
+		Segment:  segmentIndex,
+		StartPTS: uint64(segmentIndex) * media.SegmentDuration,
+		EndPTS:   uint64(segmentIndex+1) * media.SegmentDuration,
+	})
+	note.Kind = store.ReleaseWithdraw
+	note.Reason = reason
+	note.Correction = p.corrections
+	note.WithdrawnID = correctionID
+	p.fillChangeChecksums(&note, current, restored, segmentIndex, target.ParentID)
+	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	index := store.Index{WindowStart: current.WindowStart, Timeline: current.Timeline, Variants: variants}
+	if err := p.store.Commit(id, index); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	if err := p.store.SetCurrent(p.stream, id); err != nil {
+		return nil, err
+	}
+	p.latestID = id
+	p.nextSequence++
+	if err := p.cleanup(&index); err != nil {
+		return nil, err
+	}
+	return p.store.ReadIndex(id)
+}
+
+func (p *Publisher) CurrentReleaseNote() (*store.ReleaseNote, error) {
+	if p.latestID == "" {
+		return nil, fmt.Errorf("stream %s has no published release", p.stream)
+	}
+	return p.store.ReadReleaseNote(p.latestID)
+}
+
+func (p *Publisher) ReleaseNote(id string) (*store.ReleaseNote, error) {
+	return p.store.ReadReleaseNote(id)
+}
+
+func (p *Publisher) CompareReleases(fromID, toID string) (*store.ReleaseComparison, error) {
+	return p.store.CompareReleases(fromID, toID)
+}
+
+func (p *Publisher) ReleaseNotes() ([]store.ReleaseNote, error) {
+	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", "versions"))
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if _, ok := parseVersionID(entry.Name(), p.stream); ok {
+				ids = append(ids, entry.Name())
+			}
+		}
+	}
+	sort.Strings(ids)
+	notes := make([]store.ReleaseNote, 0, len(ids))
+	for _, id := range ids {
+		note, err := p.store.ReadReleaseNote(id)
+		if err != nil {
+			return nil, err
+		}
+		notes = append(notes, *note)
+	}
+	return notes, nil
+}
+
+func (p *Publisher) latestCorrectionID(segmentIndex int) (string, error) {
+	return p.decisionForSegment(p.latestID, segmentIndex)
+}
+
+func (p *Publisher) decisionForSegment(id string, segmentIndex int) (string, error) {
+	for id != "" {
+		note, err := p.store.ReadReleaseNote(id)
+		if err != nil {
+			return "", err
+		}
+		applies := false
+		for _, change := range note.Changes {
+			if change.Segment == segmentIndex {
+				applies = true
+				break
+			}
+		}
+		if applies && note.Kind == store.ReleaseCorrect {
+			return id, nil
+		}
+		if applies && note.Kind == store.ReleaseWithdraw {
+			target, err := p.store.ReadReleaseNote(note.WithdrawnID)
+			if err != nil {
+				return "", err
+			}
+			return p.decisionForSegment(target.ParentID, segmentIndex)
+		}
+		id = note.ParentID
+	}
+	return "", fmt.Errorf("segment %d has no active correction to withdraw", segmentIndex)
+}
+
+func (p *Publisher) variantsWithReplacement(current, restored *store.Index, segmentIndex int) ([]store.Variant, bool) {
+	variants := make([]store.Variant, 0, len(current.Variants))
+	changed := false
+	for _, currentVariant := range current.Variants {
+		segments := make([]store.Segment, 0, len(currentVariant.Segments))
+		for _, segment := range currentVariant.Segments {
+			if segment.Index == segmentIndex {
+				for _, restoredVariant := range restored.Variants {
+					if restoredVariant.Name != currentVariant.Name {
+						continue
+					}
+					for _, restoredSegment := range restoredVariant.Segments {
+						if restoredSegment.Index == segmentIndex {
+							segment.SHA256 = restoredSegment.SHA256
+							changed = true
+						}
+					}
+				}
+			}
+			segments = append(segments, segment)
+		}
+		variants = append(variants, store.Variant{Name: currentVariant.Name, Width: currentVariant.Width, Height: currentVariant.Height, Segments: segments})
+	}
+	return variants, changed
+}
+
+func (p *Publisher) buildPublicationNote(id, parentID string, variants []store.Variant, template store.ReleaseContent) store.ReleaseNote {
+	note := store.ReleaseNote{ID: id, ParentID: parentID, Changes: []store.ReleaseContent{}, Adoptions: []store.ReleaseContent{}}
+	if len(variants) > 0 && len(variants[0].Segments) > 0 {
+		note.WindowStart = variants[0].Segments[0].Start
+		note.Timeline = variants[0].Segments[len(variants[0].Segments)-1].End
+	}
+	for _, variant := range variants {
+		for _, segment := range variant.Segments {
+			content := store.ReleaseContent{
+				Variant:     variant.Name,
+				Segment:     segment.Index,
+				StartPTS:    segment.Start,
+				EndPTS:      segment.End,
+				AfterSHA256: segment.SHA256,
+				AdoptedFrom: parentID,
+			}
+			if segment.Index == template.Segment && template.Variant == "" || content.Variant == template.Variant && content.Segment == template.Segment {
+				if parentID == "" {
+					content.AdoptedFrom = id
+				}
+				note.Changes = append(note.Changes, content)
+			} else {
+				note.Adoptions = append(note.Adoptions, content)
+			}
+		}
+	}
+	return note
+}
+
+func (p *Publisher) fillChangeChecksums(note *store.ReleaseNote, before, after *store.Index, segmentIndex int, adoptedFrom string) {
+	beforeSums := map[string]string{}
+	afterSums := map[string]string{}
+	collect := func(index *store.Index) map[string]string {
+		sums := map[string]string{}
+		for _, variant := range index.Variants {
+			for _, segment := range variant.Segments {
+				if segment.Index == segmentIndex {
+					sums[variant.Name] = segment.SHA256
+				}
+			}
+		}
+		return sums
+	}
+	beforeSums, afterSums = collect(before), collect(after)
+	for i := range note.Changes {
+		name := note.Changes[i].Variant
+		note.Changes[i].BeforeSHA256 = beforeSums[name]
+		note.Changes[i].AfterSHA256 = afterSums[name]
+		note.Changes[i].AdoptedFrom = adoptedFrom
+	}
+}
+
+func (p *Publisher) withdrawCopyCallback(restoredSegment int, restoredID string) func(string, int, string) error {
+	return func(variantName string, segmentIndex int, destination string) error {
+		sourceID := p.latestID
+		if segmentIndex == restoredSegment {
+			sourceID = restoredID
+		}
+		index, err := p.store.ReadIndex(sourceID)
+		if err != nil {
+			return err
+		}
+		for _, variant := range index.Variants {
+			if variant.Name != variantName {
+				continue
+			}
+			for _, segment := range variant.Segments {
+				if segment.Index == segmentIndex {
+					return copyFile(p.store.SegmentPath(sourceID, variantName, segment), destination)
+				}
+			}
+		}
+		return fmt.Errorf("segment %d/%s unavailable", segmentIndex, variantName)
+	}
+}
+
+func firstReason(reasons []string) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	return reasons[0]
 }
 
 func (p *Publisher) correctCopyCallback(correctedSegment int, stagingSources string) func(string, int, string) error {

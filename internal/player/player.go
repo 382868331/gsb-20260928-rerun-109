@@ -107,6 +107,22 @@ func (p *Player) Switch(name string) error {
 
 func (p *Player) Publication() string { return p.publication }
 
+func (p *Player) ReleaseNote() (*store.ReleaseNote, error) {
+	return p.store.ReadReleaseNote(p.publication)
+}
+
+func (p *Player) AdoptedReleaseID(variantName string, segmentIndex int) (string, store.ReleaseContent, error) {
+	note, content, err := p.store.ContentOrigin(p.publication, variantName, segmentIndex)
+	if err != nil {
+		return "", store.ReleaseContent{}, err
+	}
+	return note.ID, content, nil
+}
+
+func (p *Player) CurrentDecision() (*store.ReleaseNote, error) {
+	return p.ReleaseNote()
+}
+
 func (p *Player) Window() (uint64, uint64) {
 	variant := p.variants[p.current]
 	if len(variant.Segments) == 0 {

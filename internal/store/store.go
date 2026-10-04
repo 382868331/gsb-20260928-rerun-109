@@ -41,6 +41,63 @@ type Index struct {
 	Variants    []Variant `json:"variants"`
 }
 
+type ReleaseKind string
+
+const (
+	ReleasePublish  ReleaseKind = "publish"
+	ReleaseCorrect  ReleaseKind = "correct"
+	ReleaseWithdraw ReleaseKind = "withdraw"
+	ReleaseNoteName             = "release.json"
+)
+
+// ReleaseContent records one variant/segment content value in a release
+// decision. BeforeSHA256 is empty for newly published segments. AdoptedFrom
+// identifies the release that supplied AfterSHA256; for newly generated
+// content it is the release itself.
+type ReleaseContent struct {
+	Variant      string `json:"variant"`
+	Segment      int    `json:"segment"`
+	StartPTS     uint64 `json:"start_pts"`
+	EndPTS       uint64 `json:"end_pts"`
+	BeforeSHA256 string `json:"before_sha256,omitempty"`
+	AfterSHA256  string `json:"after_sha256"`
+	AdoptedFrom  string `json:"adopted_from,omitempty"`
+}
+
+type ReleaseNote struct {
+	ID          string           `json:"id"`
+	ParentID    string           `json:"parent_id,omitempty"`
+	Kind        ReleaseKind      `json:"kind"`
+	Reason      string           `json:"reason,omitempty"`
+	Correction  int              `json:"correction,omitempty"`
+	WithdrawnID string           `json:"withdrawn_id,omitempty"`
+	WindowStart uint64           `json:"window_start_pts"`
+	Timeline    uint64           `json:"timeline_duration"`
+	Changes     []ReleaseContent `json:"changes"`
+	Adoptions   []ReleaseContent `json:"adoptions"`
+}
+
+type ReleaseVariantComparison struct {
+	Name       string `json:"name"`
+	FromSHA256 string `json:"from_sha256,omitempty"`
+	ToSHA256   string `json:"to_sha256,omitempty"`
+	Changed    bool   `json:"changed"`
+}
+
+type ReleaseSegmentComparison struct {
+	Segment  int                        `json:"segment"`
+	StartPTS uint64                     `json:"start_pts"`
+	EndPTS   uint64                     `json:"end_pts"`
+	Variants []ReleaseVariantComparison `json:"variants"`
+}
+
+type ReleaseComparison struct {
+	FromID   string                     `json:"from_id"`
+	ToID     string                     `json:"to_id"`
+	Ranges   []Range                    `json:"ranges"`
+	Segments []ReleaseSegmentComparison `json:"segments"`
+}
+
 // Range is a half-open PTS interval [Start,End) on the shared timeline.
 type Range struct {
 	Start uint64 `json:"start_pts"`
@@ -94,6 +151,64 @@ func DiffRanges(before, after *Index) []Range {
 		ranges = append(ranges, Range{Start: start, End: end})
 	}
 	return ranges
+}
+
+// CompareReleases compares two retained immutable publications. It includes
+// every segment present in either release and per-variant checksums.
+func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error) {
+	from, err := s.ReadIndex(fromID)
+	if err != nil {
+		return nil, err
+	}
+	to, err := s.ReadIndex(toID)
+	if err != nil {
+		return nil, err
+	}
+	fromByVariant := map[string]map[int]Segment{}
+	toByVariant := map[string]map[int]Segment{}
+	segmentSet := map[int]bool{}
+	variantSet := map[string]bool{}
+	indexMaps := func(index *Index) map[string]map[int]Segment {
+		result := map[string]map[int]Segment{}
+		for _, variant := range index.Variants {
+			variantSet[variant.Name] = true
+			segments := map[int]Segment{}
+			for _, segment := range variant.Segments {
+				segments[segment.Index] = segment
+				segmentSet[segment.Index] = true
+			}
+			result[variant.Name] = segments
+		}
+		return result
+	}
+	fromByVariant = indexMaps(from)
+	toByVariant = indexMaps(to)
+	variants := make([]string, 0, len(variantSet))
+	for name := range variantSet {
+		variants = append(variants, name)
+	}
+	sort.Strings(variants)
+	segments := make([]int, 0, len(segmentSet))
+	for segment := range segmentSet {
+		segments = append(segments, segment)
+	}
+	sort.Ints(segments)
+	comparison := &ReleaseComparison{FromID: fromID, ToID: toID, Ranges: DiffRanges(from, to)}
+	for _, segmentIndex := range segments {
+		item := ReleaseSegmentComparison{
+			Segment:  segmentIndex,
+			StartPTS: uint64(segmentIndex) * media.SegmentDuration,
+			EndPTS:   uint64(segmentIndex+1) * media.SegmentDuration,
+		}
+		for _, name := range variants {
+			fromSegment := fromByVariant[name][segmentIndex]
+			toSegment := toByVariant[name][segmentIndex]
+			entry := ReleaseVariantComparison{Name: name, FromSHA256: fromSegment.SHA256, ToSHA256: toSegment.SHA256, Changed: fromSegment.SHA256 != toSegment.SHA256}
+			item.Variants = append(item.Variants, entry)
+		}
+		comparison.Segments = append(comparison.Segments, item)
+	}
+	return comparison, nil
 }
 
 type Retention struct {
@@ -294,6 +409,60 @@ func (s *Store) ReadIndex(id string) (*Index, error) {
 		return nil, err
 	}
 	return &index, nil
+}
+
+func (s *Store) WriteStagingReleaseNote(id string, note ReleaseNote) error {
+	data, err := json.MarshalIndent(note, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(s.path("publish", "staging-"+id), ReleaseNoteName)
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func (s *Store) ReadReleaseNote(id string) (*ReleaseNote, error) {
+	data, err := os.ReadFile(s.path("publish", "versions", id, ReleaseNoteName))
+	if err != nil {
+		return nil, err
+	}
+	var note ReleaseNote
+	if err := json.Unmarshal(data, &note); err != nil {
+		return nil, err
+	}
+	return &note, nil
+}
+
+// ContentOrigin follows AdoptedFrom links until it reaches the release that
+// generated the requested variant/segment checksum.
+func (s *Store) ContentOrigin(id, variantName string, segmentIndex int) (*ReleaseNote, ReleaseContent, error) {
+	for {
+		note, err := s.ReadReleaseNote(id)
+		if err != nil {
+			return nil, ReleaseContent{}, err
+		}
+		content, ok := releaseContent(note, variantName, segmentIndex)
+		if !ok {
+			return nil, ReleaseContent{}, fmt.Errorf("segment %d for variant %q is not in release %s", segmentIndex, variantName, id)
+		}
+		if content.AdoptedFrom == "" || content.AdoptedFrom == id {
+			return note, content, nil
+		}
+		id = content.AdoptedFrom
+	}
+}
+
+func releaseContent(note *ReleaseNote, variantName string, segmentIndex int) (ReleaseContent, bool) {
+	for _, content := range note.Changes {
+		if content.Variant == variantName && content.Segment == segmentIndex {
+			return content, true
+		}
+	}
+	for _, content := range note.Adoptions {
+		if content.Variant == variantName && content.Segment == segmentIndex {
+			return content, true
+		}
+	}
+	return ReleaseContent{}, false
 }
 
 func (s *Store) SegmentPath(id, variant string, segment Segment) string {

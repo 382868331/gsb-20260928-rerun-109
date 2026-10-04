@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,12 @@ func main() {
 		err = publishLive(os.Args[2:])
 	case "correct":
 		err = correct(os.Args[2:])
+	case "withdraw-correction":
+		err = withdrawCorrection(os.Args[2:])
+	case "releases":
+		err = releases(os.Args[2:])
+	case "compare-releases":
+		err = compareReleases(os.Args[2:])
 	case "read-live":
 		err = readLive(os.Args[2:])
 	default:
@@ -40,7 +47,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|read-live [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|withdraw-correction|releases|compare-releases|read-live [flags]")
 	os.Exit(2)
 }
 
@@ -73,6 +80,7 @@ func correct(args []string) error {
 	stream := fs.String("stream", "live", "stream name")
 	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
 	segment := fs.Int("segment", -1, "in-window segment index to replace with corrected content")
+	reason := fs.String("reason", "", "operator-provided reason for the correction")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -83,11 +91,100 @@ func correct(args []string) error {
 	if err != nil {
 		return err
 	}
-	index, err := publisher.Correct(*segment)
+	index, err := publisher.Correct(*segment, *reason)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("corrected=%s segment=%d window=[%d,%d)\n", index.ID, *segment, index.WindowStart, index.Timeline)
+	return nil
+}
+
+func withdrawCorrection(args []string) error {
+	fs := flag.NewFlagSet("withdraw-correction", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	segment := fs.Int("segment", -1, "in-window segment whose latest active correction is withdrawn")
+	correctionID := fs.String("correction", "", "specific correction publication id to withdraw")
+	reason := fs.String("reason", "", "operator-provided reason for withdrawing the correction")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	var index *store.Index
+	if *correctionID != "" {
+		index, err = publisher.Withdraw(*correctionID, *reason)
+	} else if *segment >= 0 {
+		index, err = publisher.WithdrawCorrection(*segment, *reason)
+	} else {
+		return fmt.Errorf("-segment or -correction is required")
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("withdrawn=%s window=[%d,%d)\n", index.ID, index.WindowStart, index.Timeline)
+	return nil
+}
+
+func releases(args []string) error {
+	fs := flag.NewFlagSet("releases", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	id := fs.String("id", "", "specific publication id to inspect")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	var value any
+	if *id != "" {
+		value, err = publisher.ReleaseNote(*id)
+	} else {
+		value, err = publisher.ReleaseNotes()
+	}
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", data)
+	return nil
+}
+
+func compareReleases(args []string) error {
+	fs := flag.NewFlagSet("compare-releases", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	from := fs.String("from", "", "older publication id")
+	to := fs.String("to", "", "newer publication id")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *from == "" || *to == "" {
+		return fmt.Errorf("-from and -to are required")
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	comparison, err := publisher.CompareReleases(*from, *to)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(comparison, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s\n", data)
 	return nil
 }
 
