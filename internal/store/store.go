@@ -19,11 +19,12 @@ import (
 const LayoutVersion = 1
 
 type Segment struct {
-	Index  int    `json:"index"`
-	Start  uint64 `json:"start_pts"`
-	End    uint64 `json:"end_pts"`
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
+	Index    int    `json:"index"`
+	Revision int    `json:"revision,omitempty"`
+	Start    uint64 `json:"start_pts"`
+	End      uint64 `json:"end_pts"`
+	Path     string `json:"path"`
+	SHA256   string `json:"sha256"`
 }
 
 type Variant struct {

@@ -3,11 +3,11 @@ package live
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -17,11 +17,14 @@ import (
 
 const DefaultWindowSegments = 4
 
+var ErrCorrectionExpired = errors.New("correction target has left the live window")
+
 type Publisher struct {
 	store          *store.Store
 	stream         string
 	windowSegments int
 	nextSegment    int
+	nextVersion    int
 }
 
 func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
@@ -55,11 +58,13 @@ func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		if number, ok := parseVersionID(entry.Name(), stream); ok && number > latest {
+		name := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), "-next"), "-old")
+		if number, ok := parseVersionID(name, stream); ok && number > latest {
 			latest = number
 		}
 	}
 	if latest >= 0 {
+		p.nextVersion = latest + 1
 		index, err := s.ReadIndex(p.VersionID(latest))
 		if err != nil {
 			return nil, err
@@ -92,8 +97,7 @@ func (p *Publisher) VersionID(sequence int) string {
 
 func (p *Publisher) PublishNext() (*store.Index, error) {
 	segment := p.nextSegment
-	sequence := segment
-	id := p.VersionID(sequence)
+	id := p.VersionID(p.nextVersion)
 	if p.store.VersionExists(id) {
 		return nil, fmt.Errorf("publication %s already exists", id)
 	}
@@ -112,27 +116,22 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 		if err != nil {
 			return nil, err
 		}
-		windowStartIndex := segment - p.windowSegments + 1
-		if windowStartIndex < 0 {
-			windowStartIndex = 0
-		}
-		segments := make([]store.Segment, 0, segment-windowStartIndex+1)
-		for i := windowStartIndex; i <= segment; i++ {
-			start := uint64(i) * media.SegmentDuration
-			segments = append(segments, store.Segment{Index: i, Start: start, End: start + media.SegmentDuration, Path: store.SegmentFileName(i), SHA256: checksumForNewWindow(i, checksum, segment)})
-		}
-		variants = append(variants, store.Variant{Name: spec.Name, Width: spec.Width, Height: spec.Height, Segments: segments})
+		variant := store.Variant{Name: spec.Name, Width: spec.Width, Height: spec.Height}
+		variant.Segments = p.baseSegments(spec.Name, segment)
+		variant.Segments = append(variant.Segments, store.Segment{
+			Index: segment, Revision: 0,
+			Start: uint64(segment) * media.SegmentDuration,
+			End:   uint64(segment+1) * media.SegmentDuration,
+			Path:  store.SegmentFileName(segment), SHA256: checksum,
+		})
+		variants = append(variants, variant)
 	}
-	if err := p.fillChecksums(variants, segment); err != nil {
+	baseID, _ := p.currentID()
+	if _, err := p.store.Prepare(id, variants, p.copyCallback(baseID, segment, stagingSources, nil)); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
-	index := store.Index{WindowStart: variants[0].Segments[0].Start, Timeline: uint64(segment+1) * media.SegmentDuration, Variants: variants}
-	if _, err := p.store.Prepare(id, variants, p.copyCallback(segment, stagingSources)); err != nil {
-		_ = p.store.Cancel(id)
-		return nil, err
-	}
-	if err := p.store.Commit(id, index); err != nil {
+	if err := p.store.Commit(id, store.Index{Variants: variants}); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
@@ -143,57 +142,139 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 		return nil, err
 	}
 	p.nextSegment++
+	p.nextVersion++
 	return p.store.ReadIndex(id)
 }
 
-func checksumForNewWindow(index int, currentChecksum string, currentSegment int) string {
-	if index == currentSegment {
-		return currentChecksum
+func (p *Publisher) currentID() (string, *store.Index) {
+	index, id, err := p.store.CurrentForStream(p.stream)
+	if err != nil {
+		return "", nil
 	}
-	return ""
+	return id, index
 }
 
-func (p *Publisher) fillChecksums(variants []store.Variant, currentSegment int) error {
-	previousID := p.VersionID(currentSegment - 1)
-	previous, err := p.store.ReadIndex(previousID)
-	if currentSegment > 0 && err != nil {
-		return err
+// baseSegments copies the current window for a variant, retaining the stored
+// revision and checksum for every already published segment.
+func (p *Publisher) baseSegments(variantName string, appendSegment int) []store.Segment {
+	_, current := p.currentID()
+	if current == nil {
+		return nil
 	}
-	for variantIndex := range variants {
-		for segmentIndex := range variants[variantIndex].Segments {
-			segment := &variants[variantIndex].Segments[segmentIndex]
-			if segment.SHA256 != "" {
+	windowStart := appendSegment - p.windowSegments + 1
+	for _, variant := range current.Variants {
+		if variant.Name != variantName {
+			continue
+		}
+		segments := make([]store.Segment, 0, len(variant.Segments))
+		for _, segment := range variant.Segments {
+			if segment.Index < windowStart {
 				continue
 			}
-			found := false
-			if previous != nil {
-				for _, oldVariant := range previous.Variants {
-					if oldVariant.Name != variants[variantIndex].Name {
-						continue
-					}
-					for _, oldSegment := range oldVariant.Segments {
-						if oldSegment.Index == segment.Index {
-							segment.SHA256 = oldSegment.SHA256
-							found = true
-						}
-					}
-				}
+			if appendSegment >= 0 && segment.Index > appendSegment {
+				continue
 			}
-			if !found {
-				return fmt.Errorf("missing retained segment %d for %s", segment.Index, variants[variantIndex].Name)
-			}
+			segments = append(segments, store.Segment{
+				Index: segment.Index, Revision: segment.Revision,
+				Start: segment.Start, End: segment.End,
+				Path: store.SegmentFileName(segment.Index), SHA256: segment.SHA256,
+			})
 		}
+		return segments
 	}
 	return nil
 }
 
-func (p *Publisher) copyCallback(currentSegment int, stagingSources string) func(string, int, string) error {
-	return func(variantName string, segmentIndex int, destination string) error {
-		if segmentIndex == currentSegment {
-			return copyFile(filepath.Join(stagingSources, variantName+".sm"), destination)
+// PublishCorrection replaces one segment that is still inside the live window.
+// New content is produced for every quality variant from the same decision:
+// the staging copy and checksum verification must succeed for all variants
+// before the new version and stream pointer are committed, so a failure leaves
+// the complete previous version playable.
+func (p *Publisher) PublishCorrection(correction media.Correction) (*store.Index, error) {
+	segment := correction.Segment
+	if segment < 0 {
+		return nil, fmt.Errorf("correction segment %d is invalid", segment)
+	}
+	baseID, current := p.currentID()
+	if current == nil {
+		return nil, fmt.Errorf("no published version available for correction")
+	}
+	if segment < int(current.WindowStart/media.SegmentDuration) || segment >= int(current.Timeline/media.SegmentDuration) {
+		return nil, fmt.Errorf("correction segment %d is outside window [%d,%d): %w",
+			segment, current.WindowStart, current.Timeline, ErrCorrectionExpired)
+	}
+	currentRevision := 0
+	for _, variant := range current.Variants {
+		for _, candidate := range variant.Segments {
+			if candidate.Index == segment && candidate.Revision > currentRevision {
+				currentRevision = candidate.Revision
+			}
 		}
-		id := p.VersionID(currentSegment - 1)
-		index, err := p.store.ReadIndex(id)
+	}
+	revision := correction.Revision
+	if revision <= currentRevision {
+		revision = currentRevision + 1
+	}
+	id := p.VersionID(p.nextVersion)
+	if p.store.VersionExists(id) {
+		return nil, fmt.Errorf("publication %s already exists", id)
+	}
+	stagingSources := filepath.Join(p.store.Root, "live", p.stream, ".staging-correction-"+strconv.Itoa(segment)+"-r"+strconv.Itoa(revision))
+	if err := os.MkdirAll(stagingSources, 0o755); err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(stagingSources)
+	replacement := media.Correction{Segment: segment, Revision: revision, AudioGain: correction.AudioGain, VideoTint: correction.VideoTint}
+	variants := make([]store.Variant, 0, len(media.Variants))
+	for _, spec := range media.Variants {
+		sourcePath := filepath.Join(stagingSources, spec.Name+".sm")
+		if err := media.WriteCorrectedSegment(sourcePath, spec, replacement); err != nil {
+			_ = p.store.Cancel(id)
+			return nil, err
+		}
+		checksum, err := fileSHA256(sourcePath)
+		if err != nil {
+			_ = p.store.Cancel(id)
+			return nil, err
+		}
+		variant := store.Variant{Name: spec.Name, Width: spec.Width, Height: spec.Height, Segments: p.baseSegments(spec.Name, -1)}
+		if len(variant.Segments) == 0 {
+			_ = p.store.Cancel(id)
+			return nil, fmt.Errorf("variant %s has no window segments", spec.Name)
+		}
+		for i := range variant.Segments {
+			if variant.Segments[i].Index == segment {
+				variant.Segments[i].Revision = revision
+				variant.Segments[i].SHA256 = checksum
+			}
+		}
+		variants = append(variants, variant)
+	}
+	if _, err := p.store.Prepare(id, variants, p.copyCallback(baseID, segment, stagingSources, map[int]bool{segment: true})); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	if err := p.store.Commit(id, store.Index{Variants: variants}); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	if err := p.store.SetCurrent(p.stream, id); err != nil {
+		return nil, err
+	}
+	if err := p.cleanup(p.nextSegment - 1); err != nil {
+		return nil, err
+	}
+	p.nextVersion++
+	return p.store.ReadIndex(id)
+}
+
+func (p *Publisher) copyCallback(baseID string, liveSegment int, stagingSources string, corrected map[int]bool) func(string, int, string) error {
+	return func(variantName string, segmentIndex int, destination string) error {
+		source := filepath.Join(stagingSources, variantName+".sm")
+		if (segmentIndex == liveSegment && liveSegment >= 0) || corrected[segmentIndex] {
+			return copyFile(source, destination)
+		}
+		index, err := p.store.ReadIndex(baseID)
 		if err != nil {
 			return err
 		}
@@ -203,7 +284,7 @@ func (p *Publisher) copyCallback(currentSegment int, stagingSources string) func
 			}
 			for _, segment := range variant.Segments {
 				if segment.Index == segmentIndex {
-					return copyFile(p.store.SegmentPath(id, variantName, segment), destination)
+					return copyFile(p.store.SegmentPath(baseID, variantName, segment), destination)
 				}
 			}
 		}
@@ -217,21 +298,23 @@ func (p *Publisher) cleanup(currentSegment int) error {
 	if err != nil {
 		return err
 	}
-	ids := make([]int, 0)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		if number, ok := parseVersionID(entry.Name(), p.stream); ok {
-			ids = append(ids, number)
+		name := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), "-next"), "-old")
+		if _, ok := parseVersionID(name, p.stream); !ok {
+			continue
 		}
-	}
-	sort.Ints(ids)
-	for _, number := range ids {
-		if number >= minKeep {
-			break
+		index, err := p.store.ReadIndex(name)
+		if err != nil {
+			return err
 		}
-		if err := p.store.RemoveVersion(p.VersionID(number)); err != nil {
+		lastSegment := int(index.Timeline/media.SegmentDuration) - 1
+		if lastSegment >= minKeep {
+			continue
+		}
+		if err := p.store.RemoveVersion(name); err != nil {
 			return err
 		}
 	}

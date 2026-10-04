@@ -26,6 +26,8 @@ func main() {
 		err = read(os.Args[2:])
 	case "live":
 		err = publishLive(os.Args[2:])
+	case "correct":
+		err = correctLive(os.Args[2:])
 	case "read-live":
 		err = readLive(os.Args[2:])
 	default:
@@ -38,7 +40,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|read-live [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|read-live [flags]")
 	os.Exit(2)
 }
 
@@ -66,6 +68,46 @@ func publishLive(args []string) error {
 }
 
 func readLive(args []string) error {
+	return readLiveArgs(args)
+}
+
+func correctLive(args []string) error {
+	fs := flag.NewFlagSet("correct", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	segment := fs.Int("segment", 0, "segment inside the current window to correct")
+	gain := fs.Float64("gain", 0.5, "replacement audio gain")
+	tint := fs.Int("tint", 200, "replacement video red tint")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	publisher, err := live.NewPublisher(*root, *stream, live.DefaultWindowSegments)
+	if err != nil {
+		return err
+	}
+	index, err := publisher.PublishCorrection(media.Correction{
+		Segment: *segment, AudioGain: *gain, VideoTint: byte(*tint),
+	})
+	if err != nil {
+		return err
+	}
+	corrected := []int{}
+	for _, variant := range index.Variants {
+		for _, candidate := range variant.Segments {
+			if candidate.Index == *segment {
+				corrected = append(corrected, candidate.Revision)
+			}
+		}
+	}
+	revision := 0
+	if len(corrected) > 0 {
+		revision = corrected[0]
+	}
+	fmt.Printf("corrected=%s segment=%d revision=%d window=[%d,%d)\n", index.ID, *segment, revision, index.WindowStart, index.Timeline)
+	return nil
+}
+
+func readLiveArgs(args []string) error {
 	fs := flag.NewFlagSet("read-live", flag.ContinueOnError)
 	root := fs.String("root", "data", "media repository root")
 	stream := fs.String("stream", "live", "stream name")

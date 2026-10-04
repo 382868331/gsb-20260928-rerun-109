@@ -26,6 +26,14 @@
 
 播放器固定在打开的清单版本上，调用 `Refresh` 才会切到当前清单。若播放位置已经落在新窗口外，会返回 `ErrWindowExpired`，旧清单不会被悄悄拼接；播放者可以调用 `JumpToLive` 明确跳到最新片段，或者继续读完旧版本后收到 `ErrPlaybackEnded` 停止。`JumpTo` 用于在当前窗口内回看，只接受窗口内片段边界。
 
+## 内容更正
+
+对仍在窗口中的已公布片段可以发布更正（替换错误画面、修正音量）。`Publisher.PublishCorrection` 用同一时间基重新渲染该片段并在索引中提升 `revision`，但窗口边界和总时长不变：更正形成独立的新版本，正在播放旧版本的用户不会在片段中途混入新内容；新打开的播放者通过流指针直接得到最新版本。
+
+播放者主动 `Refresh` 时位置保持在同一内容时刻（只会落在片段边界），`ChangedSegments` 返回当前档位上与旧版本不同的区间。若持有的位置已经滚出新窗口，`Refresh` 仍返回 `ErrWindowExpired`，由播放者明确 `JumpToLive` 跳转或读旧版到 `ErrPlaybackEnded` 停止。对已经离开窗口的片段发起更返回 `ErrCorrectionExpired`，且不改动当前版本。
+
+所有质量档的更正是同一次内容决定：暂存目录会为每个档位复制替换片段并逐文件做 SHA-256 校验，任一档位失败都会取消暂存，流指针和完整旧版保持不变。被播放者引用的旧版本（含其片段文件）在引用释放前不会被窗口滚动清理；释放后后续发布才删除。
+
 ## 运行
 
 ```bash
@@ -34,6 +42,7 @@ go run ./cmd/streamctl demo -root /tmp/localstream-demo -id v1
 go run ./cmd/streamctl read -root /tmp/localstream-demo -variant base -switch-segment 2 -switch-to sharp
 go run ./cmd/streamctl live -root /tmp/localstream-live -stream news -window 4 -segments 8
 go run ./cmd/streamctl read-live -root /tmp/localstream-live -stream news -variant base -start-pts 192000 -switch-to sharp
+go run ./cmd/streamctl correct -root /tmp/localstream-live -stream news -segment 3 -gain 0.5 -tint 201
 ```
 
 测试会真实生成并解码短媒体，逐像素核对画面、逐采样核对声音，并检查完整时间线没有重叠或缺口。

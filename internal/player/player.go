@@ -17,6 +17,7 @@ type Player struct {
 	current     string
 	position    uint64
 	retention   *store.Retention
+	changed     []store.Segment
 }
 
 var (
@@ -114,6 +115,14 @@ func (p *Player) Window() (uint64, uint64) {
 	return variant.Segments[0].Start, variant.Segments[len(variant.Segments)-1].End
 }
 
+// ChangedSegments reports the segments that differ, on the current variant,
+// between the version the player held before the last Refresh and the version
+// it adopted. Players resuming after a correction use this to show users which
+// intervals were fixed.
+func (p *Player) ChangedSegments() []store.Segment {
+	return append([]store.Segment(nil), p.changed...)
+}
+
 func (p *Player) Refresh() (*store.Index, error) {
 	index, id, err := p.store.CurrentForStream(p.stream)
 	if err != nil {
@@ -128,6 +137,7 @@ func (p *Player) Refresh() (*store.Index, error) {
 	}
 	oldRetention := p.retention
 	oldPublication := p.publication
+	oldVariant := p.variants[p.current]
 	p.publication = id
 	p.variants = map[string]store.Variant{}
 	for _, variant := range index.Variants {
@@ -138,6 +148,17 @@ func (p *Player) Refresh() (*store.Index, error) {
 		retention.Release()
 		return nil, fmt.Errorf("current variant %q is unavailable after refresh", p.current)
 	}
+	newVariant := p.variants[p.current]
+	changed := make([]store.Segment, 0)
+	for _, newSegment := range newVariant.Segments {
+		for _, oldSegment := range oldVariant.Segments {
+			if oldSegment.Index == newSegment.Index &&
+				(oldSegment.Revision != newSegment.Revision || oldSegment.SHA256 != newSegment.SHA256) {
+				changed = append(changed, newSegment)
+			}
+		}
+	}
+	p.changed = changed
 	p.retention = retention
 	if err := oldRetention.Release(); err != nil {
 		return nil, err
@@ -193,6 +214,7 @@ func (p *Player) JumpToLive(targets ...store.Index) error {
 	p.variants = variants
 	p.position = target
 	p.retention = retention
+	p.changed = nil
 	if old != nil {
 		return old.Release()
 	}
