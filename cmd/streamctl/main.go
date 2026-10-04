@@ -26,6 +26,8 @@ func main() {
 		err = read(os.Args[2:])
 	case "live":
 		err = publishLive(os.Args[2:])
+	case "correct":
+		err = correct(os.Args[2:])
 	case "read-live":
 		err = readLive(os.Args[2:])
 	default:
@@ -38,7 +40,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|read-live [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|read-live [flags]")
 	os.Exit(2)
 }
 
@@ -62,6 +64,30 @@ func publishLive(args []string) error {
 		}
 		fmt.Printf("published=%s segment=%d window=[%d,%d)\n", index.ID, publisher.NextSegment()-1, index.WindowStart, index.Timeline)
 	}
+	return nil
+}
+
+func correct(args []string) error {
+	fs := flag.NewFlagSet("correct", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	segment := fs.Int("segment", -1, "in-window segment index to replace with corrected content")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *segment < 0 {
+		return fmt.Errorf("-segment is required")
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	index, err := publisher.Correct(*segment)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("corrected=%s segment=%d window=[%d,%d)\n", index.ID, *segment, index.WindowStart, index.Timeline)
 	return nil
 }
 

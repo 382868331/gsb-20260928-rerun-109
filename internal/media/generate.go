@@ -13,6 +13,17 @@ const (
 )
 
 func WriteCompleteSegment(path string, variant VariantSpec, segment int) error {
+	return writeSegmentFile(path, variant, segment, 0)
+}
+
+// WriteCorrectedSegment writes a replacement segment for an already
+// published window position. correction must be > 0 and identifies the
+// correction generation.
+func WriteCorrectedSegment(path string, variant VariantSpec, segment int, correction int) error {
+	return writeSegmentFile(path, variant, segment, correction)
+}
+
+func writeSegmentFile(path string, variant VariantSpec, segment int, correction int) error {
 	dir, name := filepath.Split(path)
 	temporary, err := os.CreateTemp(dir, "."+name+"-*.part")
 	if err != nil {
@@ -20,7 +31,7 @@ func WriteCompleteSegment(path string, variant VariantSpec, segment int) error {
 	}
 	temporaryName := temporary.Name()
 	defer os.Remove(temporaryName)
-	if err := writeCompleteSegment(temporary, variant, segment); err != nil {
+	if err := writeSegment(temporary, variant, segment, correction); err != nil {
 		temporary.Close()
 		return err
 	}
@@ -30,7 +41,7 @@ func WriteCompleteSegment(path string, variant VariantSpec, segment int) error {
 	return os.Rename(temporaryName, path)
 }
 
-func writeCompleteSegment(f *os.File, variant VariantSpec, segment int) error {
+func writeSegment(f *os.File, variant VariantSpec, segment int, correction int) error {
 	start := uint64(segment) * SegmentDuration
 	h := Header{
 		Width:     variant.Width,
@@ -50,7 +61,12 @@ func writeCompleteSegment(f *os.File, variant VariantSpec, segment int) error {
 		video := make([]byte, 0, int(variant.Width)*int(variant.Height)*3)
 		for y := range int(variant.Height) {
 			for x := range int(variant.Width) {
-				r, g, b := SourceFrame(globalFrame, int(variant.Width), int(variant.Height), x, y)
+				var r, g, b byte
+				if correction == 0 {
+					r, g, b = SourceFrame(globalFrame, int(variant.Width), int(variant.Height), x, y)
+				} else {
+					r, g, b = CorrectedFrame(globalFrame, correction, int(variant.Width), int(variant.Height), x, y)
+				}
 				video = append(video, r, g, b)
 			}
 		}
@@ -60,7 +76,11 @@ func writeCompleteSegment(f *os.File, variant VariantSpec, segment int) error {
 		audio := make([]byte, 0, int(FrameDuration)*2*2)
 		for sampleOffset := range FrameDuration {
 			for channel := 0; channel < 2; channel++ {
-				audio = AppendSample(audio, AudioSample(variant, pts+sampleOffset, globalFrame, channel))
+				sample := AudioSample(variant, pts+sampleOffset, globalFrame, channel)
+				if correction != 0 {
+					sample = CorrectedAudioSample(variant, pts+sampleOffset, globalFrame, channel, correction)
+				}
+				audio = AppendSample(audio, sample)
 			}
 		}
 		if err := w.WritePacket(Packet{Type: AudioPacket, KeyFrame: false, PTS: pts, Duration: uint32(FrameDuration), Audio: audio}); err != nil {

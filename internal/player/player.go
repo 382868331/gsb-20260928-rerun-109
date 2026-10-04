@@ -13,6 +13,7 @@ type Player struct {
 	store       *store.Store
 	stream      string
 	publication string
+	index       *store.Index
 	variants    map[string]store.Variant
 	current     string
 	position    uint64
@@ -75,7 +76,7 @@ func openIndex(s *store.Store, stream, id string, index *store.Index, initialVar
 	if err != nil {
 		return nil, nil, err
 	}
-	return &Player{store: s, stream: stream, publication: id, variants: variants, current: initialVariant, position: position, retention: retention}, index, nil
+	return &Player{store: s, stream: stream, publication: id, index: index, variants: variants, current: initialVariant, position: position, retention: retention}, index, nil
 }
 
 func (p *Player) Variant() string  { return p.current }
@@ -128,13 +129,16 @@ func (p *Player) Refresh() (*store.Index, error) {
 	}
 	oldRetention := p.retention
 	oldPublication := p.publication
+	oldIndex := p.index
 	p.publication = id
+	p.index = index
 	p.variants = map[string]store.Variant{}
 	for _, variant := range index.Variants {
 		p.variants[variant.Name] = variant
 	}
 	if _, ok := p.variants[p.current]; !ok {
 		p.publication = oldPublication
+		p.index = oldIndex
 		retention.Release()
 		return nil, fmt.Errorf("current variant %q is unavailable after refresh", p.current)
 	}
@@ -190,6 +194,7 @@ func (p *Player) JumpToLive(targets ...store.Index) error {
 	}
 	old := p.retention
 	p.publication = id
+	p.index = index
 	p.variants = variants
 	p.position = target
 	p.retention = retention
@@ -197,6 +202,23 @@ func (p *Player) JumpToLive(targets ...store.Index) error {
 		return old.Release()
 	}
 	return nil
+}
+
+// AdoptLatest moves the player to the newest published version at the same
+// content position and reports which timeline ranges differ from the
+// version the player was holding. If the current position has fallen out of
+// the new window it returns ErrWindowExpired and keeps the old version, so
+// the caller can explicitly JumpToLive or read the old version to its end.
+func (p *Player) AdoptLatest() (*store.Index, []store.Range, error) {
+	before := p.index
+	index, err := p.Refresh()
+	if err != nil {
+		return index, nil, err
+	}
+	if before == nil {
+		return index, nil, nil
+	}
+	return index, store.DiffRanges(before, index), nil
 }
 
 func (p *Player) Close() error {

@@ -22,6 +22,9 @@ type Publisher struct {
 	stream         string
 	windowSegments int
 	nextSegment    int
+	nextSequence   int
+	latestID       string
+	corrections    int
 }
 
 func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
@@ -65,6 +68,8 @@ func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
 			return nil, err
 		}
 		p.nextSegment = int(index.Timeline / media.SegmentDuration)
+		p.nextSequence = latest + 1
+		p.latestID = p.VersionID(latest)
 	}
 	return p, nil
 }
@@ -92,8 +97,7 @@ func (p *Publisher) VersionID(sequence int) string {
 
 func (p *Publisher) PublishNext() (*store.Index, error) {
 	segment := p.nextSegment
-	sequence := segment
-	id := p.VersionID(sequence)
+	id := p.VersionID(p.nextSequence)
 	if p.store.VersionExists(id) {
 		return nil, fmt.Errorf("publication %s already exists", id)
 	}
@@ -139,11 +143,108 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 	if err := p.store.SetCurrent(p.stream, id); err != nil {
 		return nil, err
 	}
-	if err := p.cleanup(segment); err != nil {
+	p.latestID = id
+	p.nextSequence++
+	if err := p.cleanup(&index); err != nil {
 		return nil, err
 	}
 	p.nextSegment++
 	return p.store.ReadIndex(id)
+}
+
+// Correct republishes a single in-window segment with replacement content
+// across every variant as one atomic decision. The corrected segments are
+// generated, copied and verified for all variants before the new immutable
+// version replaces the current pointer; on any failure the previous version
+// stays fully intact and current.
+func (p *Publisher) Correct(segmentIndex int) (*store.Index, error) {
+	if p.latestID == "" {
+		return nil, fmt.Errorf("stream %s has no published version to correct", p.stream)
+	}
+	latest, err := p.store.ReadIndex(p.latestID)
+	if err != nil {
+		return nil, err
+	}
+	first := int(latest.WindowStart / media.SegmentDuration)
+	last := int(latest.Timeline/media.SegmentDuration) - 1
+	if segmentIndex < first || segmentIndex > last {
+		return nil, fmt.Errorf("segment %d is outside the correctable window [%d,%d]", segmentIndex, first, last)
+	}
+	id := p.VersionID(p.nextSequence)
+	if p.store.VersionExists(id) {
+		return nil, fmt.Errorf("publication %s already exists", id)
+	}
+	correction := p.corrections + 1
+	stagingSources := filepath.Join(p.store.Root, "live", p.stream, ".staging-correct-"+strconv.Itoa(segmentIndex))
+	if err := os.MkdirAll(stagingSources, 0o755); err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(stagingSources)
+	checksums := map[string]string{}
+	for _, spec := range media.Variants {
+		sourcePath := filepath.Join(stagingSources, spec.Name+".sm")
+		if err := media.WriteCorrectedSegment(sourcePath, spec, segmentIndex, correction); err != nil {
+			return nil, err
+		}
+		checksum, err := fileSHA256(sourcePath)
+		if err != nil {
+			return nil, err
+		}
+		checksums[spec.Name] = checksum
+	}
+	variants := make([]store.Variant, 0, len(latest.Variants))
+	for _, oldVariant := range latest.Variants {
+		segments := make([]store.Segment, 0, len(oldVariant.Segments))
+		for _, segment := range oldVariant.Segments {
+			if segment.Index == segmentIndex {
+				segment.SHA256 = checksums[oldVariant.Name]
+			}
+			segments = append(segments, segment)
+		}
+		variants = append(variants, store.Variant{Name: oldVariant.Name, Width: oldVariant.Width, Height: oldVariant.Height, Segments: segments})
+	}
+	index := store.Index{WindowStart: latest.WindowStart, Timeline: latest.Timeline, Variants: variants}
+	if _, err := p.store.Prepare(id, variants, p.correctCopyCallback(segmentIndex, stagingSources)); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	if err := p.store.Commit(id, index); err != nil {
+		_ = p.store.Cancel(id)
+		return nil, err
+	}
+	if err := p.store.SetCurrent(p.stream, id); err != nil {
+		return nil, err
+	}
+	p.latestID = id
+	p.nextSequence++
+	p.corrections = correction
+	if err := p.cleanup(&index); err != nil {
+		return nil, err
+	}
+	return p.store.ReadIndex(id)
+}
+
+func (p *Publisher) correctCopyCallback(correctedSegment int, stagingSources string) func(string, int, string) error {
+	return func(variantName string, segmentIndex int, destination string) error {
+		if segmentIndex == correctedSegment {
+			return copyFile(filepath.Join(stagingSources, variantName+".sm"), destination)
+		}
+		index, err := p.store.ReadIndex(p.latestID)
+		if err != nil {
+			return err
+		}
+		for _, variant := range index.Variants {
+			if variant.Name != variantName {
+				continue
+			}
+			for _, segment := range variant.Segments {
+				if segment.Index == segmentIndex {
+					return copyFile(p.store.SegmentPath(p.latestID, variantName, segment), destination)
+				}
+			}
+		}
+		return fmt.Errorf("segment %d/%s unavailable", segmentIndex, variantName)
+	}
 }
 
 func checksumForNewWindow(index int, currentChecksum string, currentSegment int) string {
@@ -154,10 +255,15 @@ func checksumForNewWindow(index int, currentChecksum string, currentSegment int)
 }
 
 func (p *Publisher) fillChecksums(variants []store.Variant, currentSegment int) error {
-	previousID := p.VersionID(currentSegment - 1)
-	previous, err := p.store.ReadIndex(previousID)
-	if currentSegment > 0 && err != nil {
-		return err
+	var previous *store.Index
+	if p.latestID != "" {
+		var err error
+		previous, err = p.store.ReadIndex(p.latestID)
+		if err != nil {
+			return err
+		}
+	} else if currentSegment > 0 {
+		return fmt.Errorf("missing previous publication before segment %d", currentSegment)
 	}
 	for variantIndex := range variants {
 		for segmentIndex := range variants[variantIndex].Segments {
@@ -192,8 +298,7 @@ func (p *Publisher) copyCallback(currentSegment int, stagingSources string) func
 		if segmentIndex == currentSegment {
 			return copyFile(filepath.Join(stagingSources, variantName+".sm"), destination)
 		}
-		id := p.VersionID(currentSegment - 1)
-		index, err := p.store.ReadIndex(id)
+		index, err := p.store.ReadIndex(p.latestID)
 		if err != nil {
 			return err
 		}
@@ -203,7 +308,7 @@ func (p *Publisher) copyCallback(currentSegment int, stagingSources string) func
 			}
 			for _, segment := range variant.Segments {
 				if segment.Index == segmentIndex {
-					return copyFile(p.store.SegmentPath(id, variantName, segment), destination)
+					return copyFile(p.store.SegmentPath(p.latestID, variantName, segment), destination)
 				}
 			}
 		}
@@ -211,27 +316,33 @@ func (p *Publisher) copyCallback(currentSegment int, stagingSources string) func
 	}
 }
 
-func (p *Publisher) cleanup(currentSegment int) error {
-	minKeep := currentSegment - p.windowSegments + 1
+// cleanup removes versions that lie fully before the current window and are
+// no longer referenced by any player. Versions still overlapping the window
+// or held open by a player stay readable.
+func (p *Publisher) cleanup(current *store.Index) error {
 	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", "versions"))
 	if err != nil {
 		return err
 	}
-	ids := make([]int, 0)
+	ids := make([]string, 0)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		if number, ok := parseVersionID(entry.Name(), p.stream); ok {
-			ids = append(ids, number)
+		if _, ok := parseVersionID(entry.Name(), p.stream); ok && entry.Name() != current.ID {
+			ids = append(ids, entry.Name())
 		}
 	}
-	sort.Ints(ids)
-	for _, number := range ids {
-		if number >= minKeep {
-			break
+	sort.Strings(ids)
+	for _, id := range ids {
+		index, err := p.store.ReadIndex(id)
+		if err != nil {
+			return err
 		}
-		if err := p.store.RemoveVersion(p.VersionID(number)); err != nil {
+		if index.Timeline > current.WindowStart {
+			continue
+		}
+		if err := p.store.RemoveVersion(id); err != nil {
 			return err
 		}
 	}

@@ -41,6 +41,61 @@ type Index struct {
 	Variants    []Variant `json:"variants"`
 }
 
+// Range is a half-open PTS interval [Start,End) on the shared timeline.
+type Range struct {
+	Start uint64 `json:"start_pts"`
+	End   uint64 `json:"end_pts"`
+}
+
+// DiffRanges returns the merged timeline ranges whose content differs
+// between two published indexes, across every variant. It is used to tell
+// a player which intervals changed when it adopts a corrected version.
+func DiffRanges(before, after *Index) []Range {
+	checksums := func(index *Index) map[string]map[int]string {
+		byVariant := map[string]map[int]string{}
+		for _, variant := range index.Variants {
+			bySegment := map[int]string{}
+			for _, segment := range variant.Segments {
+				bySegment[segment.Index] = segment.SHA256
+			}
+			byVariant[variant.Name] = bySegment
+		}
+		return byVariant
+	}
+	oldSums, newSums := checksums(before), checksums(after)
+	changed := map[int]bool{}
+	for name, segments := range newSums {
+		for segmentIndex, sum := range segments {
+			if oldSums[name][segmentIndex] != sum {
+				changed[segmentIndex] = true
+			}
+		}
+	}
+	for name, segments := range oldSums {
+		for segmentIndex, sum := range segments {
+			if newSums[name][segmentIndex] != sum {
+				changed[segmentIndex] = true
+			}
+		}
+	}
+	indices := make([]int, 0, len(changed))
+	for segmentIndex := range changed {
+		indices = append(indices, segmentIndex)
+	}
+	sort.Ints(indices)
+	ranges := make([]Range, 0, len(indices))
+	for _, segmentIndex := range indices {
+		start := uint64(segmentIndex) * media.SegmentDuration
+		end := start + media.SegmentDuration
+		if len(ranges) > 0 && ranges[len(ranges)-1].End == start {
+			ranges[len(ranges)-1].End = end
+			continue
+		}
+		ranges = append(ranges, Range{Start: start, End: end})
+	}
+	return ranges
+}
+
 type Retention struct {
 	store *Store
 	id    string

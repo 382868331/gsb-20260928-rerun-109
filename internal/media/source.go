@@ -38,6 +38,20 @@ func AudioSample(variant VariantSpec, ptsInTimescale uint64, frame int, channel 
 	return int16(value)
 }
 
+// CorrectedFrame returns the replacement picture for a corrected segment.
+// correction identifies the correction generation so repeated corrections
+// produce distinct, deterministic content.
+func CorrectedFrame(frame int, correction int, width, height int, x, y int) (byte, byte, byte) {
+	r, g, b := SourceFrame(frame, width, height, x, y)
+	return 255 - r, byte(int(g) + 64*correction), b
+}
+
+// CorrectedAudioSample returns the replacement audio for a corrected
+// segment, applying a volume fix relative to the original samples.
+func CorrectedAudioSample(variant VariantSpec, ptsInTimescale uint64, frame int, channel int, correction int) int16 {
+	return AudioSample(variant, ptsInTimescale, frame, channel) / 2
+}
+
 func AppendSample(b []byte, sample int16) []byte {
 	return binary.LittleEndian.AppendUint16(b, uint16(uint32(uint16(sample))))
 }
