@@ -8,6 +8,7 @@
 - `sources/short-index.json`：只包含解码成功、校验完整的片段；`.part` 或未完成片段不会进入索引。
 - `publish/versions/<id>/index.json`：不可变发布索引，记录片段边界和 SHA-256。
 - `publish/versions/<id>/<variant>/`：发布版本实际读取的片段副本。
+- `publish/streams/<stream>-releases.json`：流级发布说明日志，记录操作者缘由、涉及片段、每个质量档的前后校验值、父发布和撤回目标。
 - `publish/staging-<id>/`：待提交发布；调用取消会删除，已发布版本保持不变。
 
 片段格式为本地 `.sm` 容器：文件头记录尺寸、声道、时间基、起始 PTS 和时长；随后交错保存视频 RGB 帧与 16-bit PCM 音频。所有视频帧都是关键帧，片段起点可独立解码。
@@ -28,11 +29,15 @@
 
 ## 窗口内内容更正
 
-已经公布但仍在窗口中的片段可以更正（替换错误画面、修正音量）：`Publisher.Correct(segment)` 为所有质量档生成替换片段，校验通过后作为同一个不可变版本原子提交，任一环节失败都保留完整旧版，流指针不移动。更正版本与上一版共享窗口边界，只有被更正片段的 SHA-256 不同。
+已经公布但仍在窗口中的片段可以更正（替换错误画面、修正音量）：`Publisher.Correct(segment, reason)` 为所有质量档生成替换片段，校验通过后作为同一个不可变版本原子提交，任一环节失败都保留完整旧版，流指针不移动。更正版本与上一版共享窗口边界，只有被更正片段的 SHA-256 不同。发布说明同时保存更正缘由、涉及片段和每个质量档的前后 SHA-256；`ReleaseNotes`、`ReleaseNote(id)` 可供操作者查询。
+
+同一区间可以连续更正。每次更正都是新的发布 ID，旧发布及其索引和文件不被改写；`ComparePublications(fromID,toID)`（也可使用 `Compare`）可比较任意两次发布，返回跨档合并的 PTS 区间以及每个质量档、片段的前后校验值。播放器已采用的发布可通过 `Player.Publication()` 查询，并用该 ID 对照发布说明确认当前采用的是哪次更正。
+
+撤回某次更正必须调用 `WithdrawCorrection(correctionID, reason)` 并指定要撤回的更正发布 ID。撤回会生成新的发布决定：以该更正的父发布为内容来源复制恢复片段，再原子提交新版本并记录 `withdraws_id`，不会删除或修改被播放器持有的旧版。连续更正需按当前生效关系撤回，例如先撤回第二次更正会恢复第一次内容，再撤回第一次才恢复原始内容；重复撤回同一更正会失败。
 
 正在播放旧版本的播放者固定在旧版本上，不会在片段中途混入新内容；新打开的播放者直接得到更正后的当前版本。播放者调用 `AdoptLatest` 主动采用更正：播放位置保持在同一内容时刻接续，返回值中的 `[]store.Range` 标明与之前版本不同的区间（基于各档校验和比较、跨档合并）。若播放位置已移出新窗口，`AdoptLatest` 返回 `ErrWindowExpired` 且保持旧版本，播放者可继续读完旧版本（`ErrPlaybackEnded` 停止）或 `JumpToLive` 明确跳转。
 
-重开发布者时从最新已提交版本恢复时间线与版本序号，更正内容随保留片段进入后续版本，版本选择保持一致。
+重开发布者时从最新已提交版本恢复时间线与版本序号，并从发布说明恢复追溯信息；即使旧媒体版本已经按窗口和引用规则清理，发布说明仍保留完整校验值快照，因此连续更正、撤回链和任意两次发布比较仍可检查。播放器引用与普通窗口过期规则不变，窗口滚动只删除没有引用且完全落出窗口的版本；重开后未释放的旧持有者仍可继续读取旧版，释放后才由后续发布清理。
 
 ## 运行
 
@@ -42,6 +47,7 @@ go run ./cmd/streamctl demo -root /tmp/localstream-demo -id v1
 go run ./cmd/streamctl read -root /tmp/localstream-demo -variant base -switch-segment 2 -switch-to sharp
 go run ./cmd/streamctl live -root /tmp/localstream-live -stream news -window 4 -segments 8
 go run ./cmd/streamctl correct -root /tmp/localstream-live -stream news -segment 5
+go run ./cmd/streamctl withdraw-correction -root /tmp/localstream-live -stream news -correction-id news-00000000000000000008
 go run ./cmd/streamctl read-live -root /tmp/localstream-live -stream news -variant base -start-pts 192000 -switch-to sharp
 ```
 

@@ -333,6 +333,193 @@ func TestCorrectionPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestCorrectionReleaseNotesConsecutiveWithdrawalAndReopenTrace(t *testing.T) {
+	root := t.TempDir()
+	publisher, err := live.NewPublisher(root, "news", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original *store.Index
+	for range 4 {
+		original, err = publisher.PublishNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	oldViewer, _, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oldViewer.JumpTo(2 * media.SegmentDuration); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := publisher.Correct(2, "first reason")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := publisher.Correct(2, "second reason")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.WithdrawCorrection(first.ID, "cannot withdraw older correction while second is current"); err == nil {
+		t.Fatal("older correction withdrawn while the second correction was current")
+	}
+	holder, _, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.JumpTo(2 * media.SegmentDuration); err != nil {
+		t.Fatal(err)
+	}
+	secondWithdrawal, err := publisher.WithdrawCorrection(second.ID, "second correction was invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.WithdrawCorrection(second.ID, "cannot withdraw twice"); err == nil {
+		t.Fatal("same correction was withdrawn twice")
+	}
+	withdrawn, err := publisher.WithdrawCorrection(first.ID, "first correction was invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if holder.Publication() != second.ID {
+		t.Fatalf("holder moved from %s to %s", second.ID, holder.Publication())
+	}
+	header, packets, err := holder.ReadSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCorrectedPackets(t, "base", 2, header, packets)
+
+	adopted, ranges, err := oldViewer.AdoptLatest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted.ID != withdrawn.ID || oldViewer.Publication() != withdrawn.ID {
+		t.Fatalf("adopted=%s publication=%s", adopted.ID, oldViewer.Publication())
+	}
+	if len(ranges) != 0 {
+		t.Fatalf("withdrawal versus original changed ranges=%+v", ranges)
+	}
+	header, packets, err = oldViewer.ReadSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPackets(t, "base", header, packets)
+
+	notes := publisher.ReleaseNotes()
+	if len(notes) != 8 {
+		t.Fatalf("release notes=%d, want 8", len(notes))
+	}
+	firstNote, err := publisher.ReleaseNote(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstNote.Kind != live.ReleaseCorrection || firstNote.ParentID != original.ID || firstNote.Reason != "first reason" || len(firstNote.Segments) != 1 || firstNote.Segments[0] != 2 {
+		t.Fatalf("bad first release note: %+v", firstNote)
+	}
+	if len(firstNote.Variants) != len(media.Variants) {
+		t.Fatalf("variant notes=%d", len(firstNote.Variants))
+	}
+	for _, variant := range firstNote.Variants {
+		if variant.BeforeSHA256 == "" || variant.AfterSHA256 == "" || variant.BeforeSHA256 == variant.AfterSHA256 || variant.Relation != "corrected" {
+			t.Fatalf("bad variant note: %+v", variant)
+		}
+	}
+	withdrawnNote, err := publisher.ReleaseNote(withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withdrawnNote.Kind != live.ReleaseWithdrawal || withdrawnNote.WithdrawsID != first.ID || withdrawnNote.ParentID != secondWithdrawal.ID {
+		t.Fatalf("bad withdrawal note: %+v", withdrawnNote)
+	}
+	if len(withdrawnNote.Contents) != 2*4 {
+		t.Fatalf("contents=%d", len(withdrawnNote.Contents))
+	}
+
+	consecutive, err := publisher.ComparePublications(first.ID, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consecutive.Ranges) != 1 || consecutive.Ranges[0].Start != 2*media.SegmentDuration || consecutive.Ranges[0].End != 3*media.SegmentDuration {
+		t.Fatalf("consecutive ranges=%+v", consecutive.Ranges)
+	}
+	if len(consecutive.Segments) != len(media.Variants) {
+		t.Fatalf("consecutive segment checksums=%+v", consecutive.Segments)
+	}
+	restored, err := publisher.Compare(original.ID, withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Ranges) != 0 || len(restored.Segments) != 0 {
+		t.Fatalf("restored comparison=%+v", restored)
+	}
+
+	reopened, err := live.NewPublisher(root, "news", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consecutive, err = reopened.ComparePublications(first.ID, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consecutive.Ranges) != 1 {
+		t.Fatalf("reopened consecutive ranges=%+v", consecutive.Ranges)
+	}
+	secondWithdrawalNote, err := reopened.ReleaseNote(secondWithdrawal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondWithdrawalNote.WithdrawsID != second.ID || secondWithdrawalNote.ParentID != second.ID {
+		t.Fatalf("bad second withdrawal note: %+v", secondWithdrawalNote)
+	}
+	restoredFirst, err := reopened.Compare(first.ID, secondWithdrawal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restoredFirst.Ranges) != 0 || len(restoredFirst.Segments) != 0 {
+		t.Fatalf("first correction not restored: %+v", restoredFirst)
+	}
+
+	if !store.Open(root).VersionExists(second.ID) {
+		t.Fatal("second correction disappeared while still held")
+	}
+	if err := oldViewer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 4 { // segments 4-7; after segment 7 the old window ends at PTS 4
+		if _, err := publisher.PublishNext(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !store.Open(root).VersionExists(second.ID) {
+		t.Fatal("second correction disappeared before holder released it")
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.PublishNext(); err != nil {
+		t.Fatal(err)
+	}
+	if store.Open(root).VersionExists(second.ID) {
+		t.Fatal("expired correction remains after holder release")
+	}
+	traced, err := live.NewPublisher(root, "news", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consecutive, err = traced.ComparePublications(first.ID, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(consecutive.Segments) != len(media.Variants) || consecutive.Segments[0].FromSHA256 == "" || consecutive.Segments[0].ToSHA256 == "" {
+		t.Fatalf("post-cleanup trace lost checksums: %+v", consecutive)
+	}
+}
+
 func assertCorrectedPackets(t *testing.T, variantName string, correction int, header media.Header, packets []media.Packet) {
 	t.Helper()
 	spec := media.VariantSpec{}

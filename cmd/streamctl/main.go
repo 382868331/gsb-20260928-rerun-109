@@ -28,6 +28,8 @@ func main() {
 		err = publishLive(os.Args[2:])
 	case "correct":
 		err = correct(os.Args[2:])
+	case "withdraw-correction":
+		err = withdrawCorrection(os.Args[2:])
 	case "read-live":
 		err = readLive(os.Args[2:])
 	default:
@@ -40,7 +42,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|read-live [flags]")
+	fmt.Fprintln(os.Stderr, "usage: streamctl demo|read|live|correct|withdraw-correction|read-live [flags]")
 	os.Exit(2)
 }
 
@@ -73,6 +75,7 @@ func correct(args []string) error {
 	stream := fs.String("stream", "live", "stream name")
 	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
 	segment := fs.Int("segment", -1, "in-window segment index to replace with corrected content")
+	reason := fs.String("reason", "correct live content", "operator-visible reason for the correction")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -83,11 +86,36 @@ func correct(args []string) error {
 	if err != nil {
 		return err
 	}
-	index, err := publisher.Correct(*segment)
+	index, err := publisher.Correct(*segment, *reason)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("corrected=%s segment=%d window=[%d,%d)\n", index.ID, *segment, index.WindowStart, index.Timeline)
+	return nil
+}
+
+func withdrawCorrection(args []string) error {
+	fs := flag.NewFlagSet("withdraw-correction", flag.ContinueOnError)
+	root := fs.String("root", "data", "media repository root")
+	stream := fs.String("stream", "live", "stream name")
+	window := fs.Int("window", live.DefaultWindowSegments, "segments retained in the live window")
+	correctionID := fs.String("correction-id", "", "correction publication id to withdraw")
+	reason := fs.String("reason", "withdraw live correction", "operator-visible reason for the withdrawal")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *correctionID == "" {
+		return fmt.Errorf("-correction-id is required")
+	}
+	publisher, err := live.NewPublisher(*root, *stream, *window)
+	if err != nil {
+		return err
+	}
+	index, err := publisher.WithdrawCorrection(*correctionID, *reason)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("withdrawn=%s correction=%s window=[%d,%d)\n", index.ID, *correctionID, index.WindowStart, index.Timeline)
 	return nil
 }
 
