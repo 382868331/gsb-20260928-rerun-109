@@ -379,16 +379,19 @@ func (p *Publisher) CompareReleases(fromID, toID string) (*store.ReleaseComparis
 }
 
 func (p *Publisher) ReleaseNotes() ([]store.ReleaseNote, error) {
-	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", "versions"))
+	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", store.DecisionDir))
 	if err != nil {
 		return nil, err
 	}
 	ids := make([]string, 0)
 	for _, entry := range entries {
-		if entry.IsDir() {
-			if _, ok := parseVersionID(entry.Name(), p.stream); ok {
-				ids = append(ids, entry.Name())
-			}
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".json" {
+			continue
+		}
+		id := strings.TrimSuffix(name, filepath.Ext(name))
+		if _, ok := parseVersionID(id, p.stream); ok {
+			ids = append(ids, id)
 		}
 	}
 	sort.Strings(ids)

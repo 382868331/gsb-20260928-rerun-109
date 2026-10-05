@@ -1,6 +1,7 @@
 package live_test
 
 import (
+	"errors"
 	"testing"
 
 	"localstream/internal/live"
@@ -215,6 +216,158 @@ func TestCorrectionReleaseNotesContinuousComparisonWithdrawalAndReopen(t *testin
 	}
 	if len(comparisonAfterReopen.Ranges) != 0 {
 		t.Fatalf("first correction to withdrawal ranges=%+v", comparisonAfterReopen.Ranges)
+	}
+}
+
+func TestReleaseDecisionsSurviveMediaReclamationAfterPlayerRelease(t *testing.T) {
+	root := t.TempDir()
+	publisher, err := live.NewPublisher(root, "news", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.PublishNext(); err != nil {
+		t.Fatal(err)
+	}
+	original, err := publisher.PublishNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	viewer, current, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != original.ID {
+		t.Fatalf("opened %s, want %s", current.ID, original.ID)
+	}
+	if _, _, err := viewer.ReadSegment(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := publisher.Correct(1, "first correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := publisher.Correct(1, "second correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawn, err := publisher.Withdraw(second.ID, "second correction withdrawn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viewer.Publication() != original.ID {
+		t.Fatalf("historical query changed player adoption to %s", viewer.Publication())
+	}
+	origin, _, err := viewer.AdoptedReleaseID("base", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origin != original.ID {
+		t.Fatalf("old player origin=%s, want %s", origin, original.ID)
+	}
+
+	for range 3 {
+		if _, err := publisher.PublishNext(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := viewer.AdoptLatest(); !errors.Is(err, player.ErrWindowExpired) {
+		t.Fatalf("adopt after expiry error=%v, want ErrWindowExpired", err)
+	}
+	if viewer.Publication() != original.ID {
+		t.Fatalf("expired adoption moved player to %s", viewer.Publication())
+	}
+	if _, _, err := viewer.ReadSegment(); err != nil {
+		t.Fatalf("retained old media is unreadable before release: %v", err)
+	}
+	s := store.Open(root)
+	if !s.VersionExists(original.ID) {
+		t.Fatal("player-held media was reclaimed before Close")
+	}
+	if s.VersionExists(first.ID) || s.VersionExists(second.ID) || s.VersionExists(withdrawn.ID) {
+		t.Fatal("unreferenced correction media avoided reclamation after window expiry")
+	}
+	if err := viewer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publisher.PublishNext(); err != nil {
+		t.Fatal(err)
+	}
+	if s.VersionExists(original.ID) {
+		t.Fatal("old media remained after the final reference was released")
+	}
+
+	for _, id := range []string{original.ID, first.ID, second.ID, withdrawn.ID} {
+		note, err := publisher.ReleaseNote(id)
+		if err != nil {
+			t.Fatalf("decision %s lost with media: %v", id, err)
+		}
+		if note.ID != id {
+			t.Fatalf("decision id=%s, want %s", note.ID, id)
+		}
+	}
+	secondNote, err := publisher.ReleaseNote(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondNote.ParentID != first.ID || secondNote.WithdrawnID != "" || secondNote.Reason != "second correction" {
+		t.Fatalf("second correction history incomplete: %+v", secondNote)
+	}
+	withdrawnNote, err := publisher.ReleaseNote(withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withdrawnNote.ParentID != second.ID || withdrawnNote.WithdrawnID != second.ID {
+		t.Fatalf("withdrawal lineage incomplete: %+v", withdrawnNote)
+	}
+	comparison, err := publisher.CompareReleases(original.ID, second.ID)
+	if err != nil {
+		t.Fatalf("historical comparison after media reclamation failed: %v", err)
+	}
+	if len(comparison.Ranges) != 1 || comparison.Ranges[0].Start != media.SegmentDuration {
+		t.Fatalf("unexpected historical ranges: %+v", comparison.Ranges)
+	}
+	withdrawnComparison, err := publisher.CompareReleases(second.ID, withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withdrawnComparison.Ranges) != 1 || len(withdrawnComparison.Segments) != 2 {
+		t.Fatalf("withdrawal comparison unavailable from decisions: %+v", withdrawnComparison)
+	}
+
+	reopened, err := live.NewPublisher(root, "news", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes, err := reopened.ReleaseNotes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notes) != 9 || notes[len(notes)-1].ID != reopened.VersionID(8) {
+		t.Fatalf("reopened history len=%d notes=%+v", len(notes), notes)
+	}
+	reopenedComparison, err := reopened.CompareReleases(first.ID, withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reopenedComparison.Ranges) != 0 {
+		t.Fatalf("withdrawn second correction should equal first: %+v", reopenedComparison.Ranges)
+	}
+	newViewer, currentAfterReopen, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newViewer.Close()
+	if currentAfterReopen.ID != reopened.VersionID(8) {
+		t.Fatalf("current after reopen=%s", currentAfterReopen.ID)
+	}
+	currentDecision, err := newViewer.CurrentDecision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentDecision.ID != currentAfterReopen.ID {
+		t.Fatalf("current decision=%s, publication=%s", currentDecision.ID, currentAfterReopen.ID)
 	}
 }
 

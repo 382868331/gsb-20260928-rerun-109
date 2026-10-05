@@ -48,6 +48,7 @@ const (
 	ReleaseCorrect  ReleaseKind = "correct"
 	ReleaseWithdraw ReleaseKind = "withdraw"
 	ReleaseNoteName             = "release.json"
+	DecisionDir                 = "decisions"
 )
 
 // ReleaseContent records one variant/segment content value in a release
@@ -153,36 +154,33 @@ func DiffRanges(before, after *Index) []Range {
 	return ranges
 }
 
-// CompareReleases compares two retained immutable publications. It includes
-// every segment present in either release and per-variant checksums.
+// CompareReleases compares two immutable release decisions. It includes
+// every segment present in either decision and per-variant checksums. Media
+// indexes may already have been reclaimed when only historical explanation
+// remains, so comparison never reads recyclable media content.
 func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error) {
-	from, err := s.ReadIndex(fromID)
+	from, err := s.ReadReleaseNote(fromID)
 	if err != nil {
 		return nil, err
 	}
-	to, err := s.ReadIndex(toID)
+	to, err := s.ReadReleaseNote(toID)
 	if err != nil {
 		return nil, err
 	}
-	fromByVariant := map[string]map[int]Segment{}
-	toByVariant := map[string]map[int]Segment{}
+	fromByVariant := releaseChecksums(from)
+	toByVariant := releaseChecksums(to)
 	segmentSet := map[int]bool{}
 	variantSet := map[string]bool{}
-	indexMaps := func(index *Index) map[string]map[int]Segment {
-		result := map[string]map[int]Segment{}
-		for _, variant := range index.Variants {
-			variantSet[variant.Name] = true
-			segments := map[int]Segment{}
-			for _, segment := range variant.Segments {
-				segments[segment.Index] = segment
-				segmentSet[segment.Index] = true
+	noteMaps := func(byVariant map[string]map[int]ReleaseContent) {
+		for name, segments := range byVariant {
+			variantSet[name] = true
+			for segmentIndex := range segments {
+				segmentSet[segmentIndex] = true
 			}
-			result[variant.Name] = segments
 		}
-		return result
 	}
-	fromByVariant = indexMaps(from)
-	toByVariant = indexMaps(to)
+	noteMaps(fromByVariant)
+	noteMaps(toByVariant)
 	variants := make([]string, 0, len(variantSet))
 	for name := range variantSet {
 		variants = append(variants, name)
@@ -193,22 +191,81 @@ func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error)
 		segments = append(segments, segment)
 	}
 	sort.Ints(segments)
-	comparison := &ReleaseComparison{FromID: fromID, ToID: toID, Ranges: DiffRanges(from, to)}
+	changedSet := map[int]bool{}
+	for name, segments := range fromByVariant {
+		for segmentIndex, content := range segments {
+			if toByVariant[name][segmentIndex].AfterSHA256 != content.AfterSHA256 {
+				changedSet[segmentIndex] = true
+			}
+		}
+	}
+	for name, segments := range toByVariant {
+		for segmentIndex := range segments {
+			if _, ok := fromByVariant[name][segmentIndex]; !ok {
+				changedSet[segmentIndex] = true
+			}
+		}
+	}
+	changedIndices := make([]int, 0, len(changedSet))
+	for segmentIndex := range changedSet {
+		changedIndices = append(changedIndices, segmentIndex)
+	}
+	sort.Ints(changedIndices)
+	ranges := make([]Range, 0, len(changedIndices))
+	for _, segmentIndex := range changedIndices {
+		start := uint64(segmentIndex) * media.SegmentDuration
+		end := start + media.SegmentDuration
+		if len(ranges) > 0 && ranges[len(ranges)-1].End == start {
+			ranges[len(ranges)-1].End = end
+			continue
+		}
+		ranges = append(ranges, Range{Start: start, End: end})
+	}
+	comparison := &ReleaseComparison{FromID: fromID, ToID: toID, Ranges: ranges}
 	for _, segmentIndex := range segments {
+		startPTS := uint64(segmentIndex) * media.SegmentDuration
+		var endPTS uint64
+		if content := fromByVariant[variants[0]][segmentIndex]; content.EndPTS != 0 {
+			startPTS = content.StartPTS
+			endPTS = content.EndPTS
+		}
+		if content := toByVariant[variants[0]][segmentIndex]; content.EndPTS != 0 {
+			startPTS = content.StartPTS
+			endPTS = content.EndPTS
+		}
+		if endPTS == 0 {
+			startPTS = uint64(segmentIndex) * media.SegmentDuration
+			endPTS = startPTS + media.SegmentDuration
+		}
 		item := ReleaseSegmentComparison{
 			Segment:  segmentIndex,
-			StartPTS: uint64(segmentIndex) * media.SegmentDuration,
-			EndPTS:   uint64(segmentIndex+1) * media.SegmentDuration,
+			StartPTS: startPTS,
+			EndPTS:   endPTS,
 		}
 		for _, name := range variants {
-			fromSegment := fromByVariant[name][segmentIndex]
-			toSegment := toByVariant[name][segmentIndex]
-			entry := ReleaseVariantComparison{Name: name, FromSHA256: fromSegment.SHA256, ToSHA256: toSegment.SHA256, Changed: fromSegment.SHA256 != toSegment.SHA256}
+			fromContent := fromByVariant[name][segmentIndex]
+			toContent := toByVariant[name][segmentIndex]
+			entry := ReleaseVariantComparison{Name: name, FromSHA256: fromContent.AfterSHA256, ToSHA256: toContent.AfterSHA256, Changed: fromContent.AfterSHA256 != toContent.AfterSHA256}
 			item.Variants = append(item.Variants, entry)
 		}
 		comparison.Segments = append(comparison.Segments, item)
 	}
 	return comparison, nil
+}
+
+func releaseChecksums(note *ReleaseNote) map[string]map[int]ReleaseContent {
+	result := map[string]map[int]ReleaseContent{}
+	add := func(contents []ReleaseContent) {
+		for _, content := range contents {
+			if result[content.Variant] == nil {
+				result[content.Variant] = map[int]ReleaseContent{}
+			}
+			result[content.Variant][content.Segment] = content
+		}
+	}
+	add(note.Changes)
+	add(note.Adoptions)
+	return result
 }
 
 type Retention struct {
@@ -300,6 +357,39 @@ func (s *Store) Commit(id string, index Index) error {
 	if err := os.WriteFile(indexPath, append(indexBytes, '\n'), 0o644); err != nil {
 		return err
 	}
+	noteBytes, err := os.ReadFile(filepath.Join(staging, ReleaseNoteName))
+	switch {
+	case err == nil:
+		decisionDir := s.path("publish", DecisionDir)
+		if err := os.MkdirAll(decisionDir, 0o755); err != nil {
+			return err
+		}
+		decisionPath := filepath.Join(decisionDir, id+".json")
+		decisionTemp, err := os.CreateTemp(decisionDir, ".decision-*")
+		if err != nil {
+			return err
+		}
+		decisionTempPath := decisionTemp.Name()
+		if len(noteBytes) == 0 || noteBytes[len(noteBytes)-1] != '\n' {
+			noteBytes = append(noteBytes, '\n')
+		}
+		if _, err := decisionTemp.Write(noteBytes); err != nil {
+			decisionTemp.Close()
+			os.Remove(decisionTempPath)
+			return err
+		}
+		if err := decisionTemp.Close(); err != nil {
+			os.Remove(decisionTempPath)
+			return err
+		}
+		if err := os.Rename(decisionTempPath, decisionPath); err != nil {
+			os.Remove(decisionTempPath)
+			return err
+		}
+	case os.IsNotExist(err):
+	default:
+		return err
+	}
 	next := filepath.Join(versions, id+"-next")
 	if err := os.RemoveAll(next); err != nil {
 		return err
@@ -317,6 +407,10 @@ func (s *Store) Commit(id string, index Index) error {
 	}
 	if err := os.Rename(next, committed); err != nil {
 		_ = os.Rename(backup, committed)
+		_ = os.Remove(s.path("publish", DecisionDir, id+".json"))
+		return err
+	}
+	if err := os.Remove(filepath.Join(committed, ReleaseNoteName)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return os.RemoveAll(backup)
@@ -421,7 +515,10 @@ func (s *Store) WriteStagingReleaseNote(id string, note ReleaseNote) error {
 }
 
 func (s *Store) ReadReleaseNote(id string) (*ReleaseNote, error) {
-	data, err := os.ReadFile(s.path("publish", "versions", id, ReleaseNoteName))
+	data, err := os.ReadFile(s.path("publish", DecisionDir, id+".json"))
+	if os.IsNotExist(err) {
+		data, err = os.ReadFile(s.path("publish", "versions", id, ReleaseNoteName))
+	}
 	if err != nil {
 		return nil, err
 	}
