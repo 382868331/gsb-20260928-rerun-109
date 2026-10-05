@@ -49,32 +49,74 @@ func NewPublisher(root, stream string, windowSegments int) (*Publisher, error) {
 			}
 		}
 	}
-	entries, err := os.ReadDir(filepath.Join(root, "publish", "versions"))
-	if err != nil && !os.IsNotExist(err) {
+	latest := -1
+	ids, err := s.ListReleaseNoteIDs()
+	if err != nil {
 		return nil, err
 	}
-	latest := -1
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if number, ok := parseVersionID(entry.Name(), stream); ok && number > latest {
+	ids, err = p.migrateLegacyReleaseNotes(ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if number, ok := parseVersionID(id, stream); ok && number > latest {
 			latest = number
 		}
 	}
 	if latest >= 0 {
-		index, err := s.ReadIndex(p.VersionID(latest))
+		id := p.VersionID(latest)
+		index, err := s.ReadIndex(id)
 		if err != nil {
 			return nil, err
 		}
 		p.nextSegment = int(index.Timeline / media.SegmentDuration)
 		p.nextSequence = latest + 1
-		p.latestID = p.VersionID(latest)
-		if note, err := s.ReadReleaseNote(p.latestID); err == nil {
-			p.corrections = note.Correction
+		p.latestID = id
+		note, err := s.ReadReleaseNote(p.latestID)
+		if err != nil {
+			return nil, err
 		}
+		p.corrections = note.Correction
 	}
 	return p, nil
+}
+
+func (p *Publisher) migrateLegacyReleaseNotes(decisionIDs []string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", "versions"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return decisionIDs, nil
+		}
+		return nil, err
+	}
+	haveDecision := map[string]bool{}
+	for _, id := range decisionIDs {
+		haveDecision[id] = true
+	}
+	changed := false
+	for _, entry := range entries {
+		if !entry.IsDir() || haveDecision[entry.Name()] {
+			continue
+		}
+		if _, ok := parseVersionID(entry.Name(), p.stream); !ok {
+			continue
+		}
+		note, err := p.store.ReadReleaseNote(entry.Name())
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if err := p.store.WriteReleaseNote(*note); err != nil {
+			return nil, err
+		}
+		changed = true
+	}
+	if !changed {
+		return decisionIDs, nil
+	}
+	return p.store.ListReleaseNoteIDs()
 }
 
 func parseVersionID(versionID, stream string) (int, bool) {
@@ -150,11 +192,12 @@ func (p *Publisher) PublishNext() (*store.Index, error) {
 	for i := range note.Changes {
 		note.Changes[i].AdoptedFrom = id
 	}
-	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+	if err := p.store.WriteReleaseNote(note); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
 	if err := p.store.Commit(id, index); err != nil {
+		_ = p.store.DeleteReleaseNote(id)
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
@@ -242,11 +285,12 @@ func (p *Publisher) Correct(segmentIndex int, reasons ...string) (*store.Index, 
 	note.Reason = reason
 	note.Correction = correction
 	p.fillChangeChecksums(&note, latest, &index, segmentIndex, id)
-	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+	if err := p.store.WriteReleaseNote(note); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
 	if err := p.store.Commit(id, index); err != nil {
+		_ = p.store.DeleteReleaseNote(id)
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
@@ -343,12 +387,13 @@ func (p *Publisher) withdrawID(current *store.Index, segmentIndex int, correctio
 	note.Correction = p.corrections
 	note.WithdrawnID = correctionID
 	p.fillChangeChecksums(&note, current, restored, segmentIndex, target.ParentID)
-	if err := p.store.WriteStagingReleaseNote(id, note); err != nil {
+	if err := p.store.WriteReleaseNote(note); err != nil {
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
 	index := store.Index{WindowStart: current.WindowStart, Timeline: current.Timeline, Variants: variants}
 	if err := p.store.Commit(id, index); err != nil {
+		_ = p.store.DeleteReleaseNote(id)
 		_ = p.store.Cancel(id)
 		return nil, err
 	}
@@ -379,18 +424,17 @@ func (p *Publisher) CompareReleases(fromID, toID string) (*store.ReleaseComparis
 }
 
 func (p *Publisher) ReleaseNotes() ([]store.ReleaseNote, error) {
-	entries, err := os.ReadDir(filepath.Join(p.store.Root, "publish", "versions"))
+	ids, err := p.store.ListReleaseNoteIDs()
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0)
-	for _, entry := range entries {
-		if entry.IsDir() {
-			if _, ok := parseVersionID(entry.Name(), p.stream); ok {
-				ids = append(ids, entry.Name())
-			}
+	streamIDs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := parseVersionID(id, p.stream); ok {
+			streamIDs = append(streamIDs, id)
 		}
 	}
+	ids = streamIDs
 	sort.Strings(ids)
 	notes := make([]store.ReleaseNote, 0, len(ids))
 	for _, id := range ids {

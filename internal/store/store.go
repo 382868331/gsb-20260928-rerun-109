@@ -44,10 +44,11 @@ type Index struct {
 type ReleaseKind string
 
 const (
-	ReleasePublish  ReleaseKind = "publish"
-	ReleaseCorrect  ReleaseKind = "correct"
-	ReleaseWithdraw ReleaseKind = "withdraw"
-	ReleaseNoteName             = "release.json"
+	ReleasePublish     ReleaseKind = "publish"
+	ReleaseCorrect     ReleaseKind = "correct"
+	ReleaseWithdraw    ReleaseKind = "withdraw"
+	ReleaseNoteName                = "release.json"
+	ReleaseDecisionDir             = "decisions"
 )
 
 // ReleaseContent records one variant/segment content value in a release
@@ -153,14 +154,15 @@ func DiffRanges(before, after *Index) []Range {
 	return ranges
 }
 
-// CompareReleases compares two retained immutable publications. It includes
-// every segment present in either release and per-variant checksums.
+// CompareReleases compares two immutable release decisions. Media versions may
+// have been reclaimed, but decision records retain every per-segment checksum
+// needed to explain historical differences.
 func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error) {
-	from, err := s.ReadIndex(fromID)
+	from, err := s.ReadReleaseNote(fromID)
 	if err != nil {
 		return nil, err
 	}
-	to, err := s.ReadIndex(toID)
+	to, err := s.ReadReleaseNote(toID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,16 +170,22 @@ func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error)
 	toByVariant := map[string]map[int]Segment{}
 	segmentSet := map[int]bool{}
 	variantSet := map[string]bool{}
-	indexMaps := func(index *Index) map[string]map[int]Segment {
+	bounds := map[int]Range{}
+	indexMaps := func(note *ReleaseNote) map[string]map[int]Segment {
 		result := map[string]map[int]Segment{}
-		for _, variant := range index.Variants {
-			variantSet[variant.Name] = true
-			segments := map[int]Segment{}
-			for _, segment := range variant.Segments {
-				segments[segment.Index] = segment
-				segmentSet[segment.Index] = true
+		for _, content := range append(append([]ReleaseContent{}, note.Changes...), note.Adoptions...) {
+			variantSet[content.Variant] = true
+			segmentSet[content.Segment] = true
+			bounds[content.Segment] = Range{Start: content.StartPTS, End: content.EndPTS}
+			if _, ok := result[content.Variant]; !ok {
+				result[content.Variant] = map[int]Segment{}
 			}
-			result[variant.Name] = segments
+			result[content.Variant][content.Segment] = Segment{
+				Index:  content.Segment,
+				Start:  content.StartPTS,
+				End:    content.EndPTS,
+				SHA256: content.AfterSHA256,
+			}
 		}
 		return result
 	}
@@ -193,22 +201,49 @@ func (s *Store) CompareReleases(fromID, toID string) (*ReleaseComparison, error)
 		segments = append(segments, segment)
 	}
 	sort.Ints(segments)
-	comparison := &ReleaseComparison{FromID: fromID, ToID: toID, Ranges: DiffRanges(from, to)}
+	changedSegments := map[int]bool{}
+	comparison := &ReleaseComparison{FromID: fromID, ToID: toID}
 	for _, segmentIndex := range segments {
 		item := ReleaseSegmentComparison{
 			Segment:  segmentIndex,
-			StartPTS: uint64(segmentIndex) * media.SegmentDuration,
-			EndPTS:   uint64(segmentIndex+1) * media.SegmentDuration,
+			StartPTS: bounds[segmentIndex].Start,
+			EndPTS:   bounds[segmentIndex].End,
 		}
 		for _, name := range variants {
 			fromSegment := fromByVariant[name][segmentIndex]
 			toSegment := toByVariant[name][segmentIndex]
 			entry := ReleaseVariantComparison{Name: name, FromSHA256: fromSegment.SHA256, ToSHA256: toSegment.SHA256, Changed: fromSegment.SHA256 != toSegment.SHA256}
+			if entry.Changed {
+				changedSegments[segmentIndex] = true
+			}
 			item.Variants = append(item.Variants, entry)
 		}
 		comparison.Segments = append(comparison.Segments, item)
 	}
+	comparison = &ReleaseComparison{FromID: fromID, ToID: toID, Ranges: comparisonRanges(changedSegments, bounds), Segments: comparison.Segments}
 	return comparison, nil
+}
+
+func comparisonRanges(changed map[int]bool, bounds map[int]Range) []Range {
+	indices := make([]int, 0, len(changed))
+	for segmentIndex := range changed {
+		indices = append(indices, segmentIndex)
+	}
+	sort.Ints(indices)
+	ranges := make([]Range, 0, len(indices))
+	for _, segmentIndex := range indices {
+		segmentRange := bounds[segmentIndex]
+		if segmentRange.End == 0 {
+			start := uint64(segmentIndex) * media.SegmentDuration
+			segmentRange = Range{Start: start, End: start + media.SegmentDuration}
+		}
+		if len(ranges) > 0 && ranges[len(ranges)-1].End == segmentRange.Start {
+			ranges[len(ranges)-1].End = segmentRange.End
+			continue
+		}
+		ranges = append(ranges, segmentRange)
+	}
+	return ranges
 }
 
 type Retention struct {
@@ -411,25 +446,78 @@ func (s *Store) ReadIndex(id string) (*Index, error) {
 	return &index, nil
 }
 
-func (s *Store) WriteStagingReleaseNote(id string, note ReleaseNote) error {
+func (s *Store) WriteReleaseNote(note ReleaseNote) error {
+	dir := s.path("publish", ReleaseDecisionDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(note, "", "  ")
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(s.path("publish", "staging-"+id), ReleaseNoteName)
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	temporary, err := os.CreateTemp(dir, ".release-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	if _, err := temporary.Write(append(data, '\n')); err != nil {
+		temporary.Close()
+		os.Remove(temporaryPath)
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		os.Remove(temporaryPath)
+		return err
+	}
+	return os.Rename(temporaryPath, filepath.Join(dir, note.ID+".json"))
+}
+
+func (s *Store) DeleteReleaseNote(id string) error {
+	err := os.Remove(s.releaseNotePath(id))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func (s *Store) ReadReleaseNote(id string) (*ReleaseNote, error) {
-	data, err := os.ReadFile(s.path("publish", "versions", id, ReleaseNoteName))
+	data, err := os.ReadFile(s.releaseNotePath(id))
 	if err != nil {
-		return nil, err
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		data, err = os.ReadFile(s.path("publish", "versions", id, ReleaseNoteName))
+		if err != nil {
+			return nil, err
+		}
 	}
 	var note ReleaseNote
 	if err := json.Unmarshal(data, &note); err != nil {
 		return nil, err
 	}
 	return &note, nil
+}
+
+func (s *Store) releaseNotePath(id string) string {
+	return s.path("publish", ReleaseDecisionDir, id+".json")
+}
+
+func (s *Store) ListReleaseNoteIDs() ([]string, error) {
+	entries, err := os.ReadDir(s.path("publish", ReleaseDecisionDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || strings.HasPrefix(entry.Name(), ".release-") {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(entry.Name(), ".json"))
+	}
+	return ids, nil
 }
 
 // ContentOrigin follows AdoptedFrom links until it reaches the release that

@@ -1,6 +1,9 @@
 package live_test
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"localstream/internal/live"
@@ -8,6 +11,191 @@ import (
 	"localstream/internal/player"
 	"localstream/internal/store"
 )
+
+func TestReleaseDecisionsSurviveMediaReclaimAfterExpiredReaderReleases(t *testing.T) {
+	root := t.TempDir()
+	publisher, err := live.NewPublisher(root, "news", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original *store.Index
+	for range 4 {
+		if original, err = publisher.PublishNext(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	viewer, opened, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.ID != original.ID {
+		t.Fatalf("opened %s, want %s", opened.ID, original.ID)
+	}
+
+	first, err := publisher.Correct(1, "first correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := publisher.Correct(1, "second correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawn, err := publisher.Withdraw(second.ID, "reject second correction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldID := original.ID
+	if viewer.Publication() != heldID {
+		t.Fatalf("viewer publication changed to %s without adoption", viewer.Publication())
+	}
+
+	for range 3 {
+		if _, err := publisher.PublishNext(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := viewer.AdoptLatest(); !errors.Is(err, player.ErrWindowExpired) {
+		t.Fatalf("adopt after expiry error=%v, want ErrWindowExpired", err)
+	}
+	if viewer.Publication() != heldID {
+		t.Fatalf("failed adoption changed viewer from %s to %s", heldID, viewer.Publication())
+	}
+
+	historical, err := publisher.CompareReleases(original.ID, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(historical.Ranges) != 1 || historical.Ranges[0].Start != media.SegmentDuration || historical.Ranges[0].End != 2*media.SegmentDuration {
+		t.Fatalf("historical comparison ranges=%+v", historical.Ranges)
+	}
+	if viewer.Publication() != heldID {
+		t.Fatalf("historical query changed viewer publication to %s", viewer.Publication())
+	}
+
+	s := store.Open(root)
+	if !s.VersionExists(heldID) {
+		t.Fatal("expired media held by a viewer was reclaimed before Close")
+	}
+	if s.VersionExists(first.ID) || s.VersionExists(withdrawn.ID) {
+		t.Fatal("unreferenced expired media was retained to preserve release history")
+	}
+	if err := viewer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := publisher.PublishNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.VersionExists(heldID) {
+		t.Fatal("held media was not reclaimed after release")
+	}
+
+	reopened, err := live.NewPublisher(root, "news", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes, err := reopened.ReleaseNotes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notes) != 11 {
+		t.Fatalf("decision history length=%d, want 11", len(notes))
+	}
+	for _, id := range []string{original.ID, first.ID, second.ID, withdrawn.ID} {
+		note, err := reopened.ReleaseNote(id)
+		if err != nil {
+			t.Fatalf("decision %s missing after media reclaim: %v", id, err)
+		}
+		if len(note.Changes) != len(media.Variants) {
+			t.Fatalf("decision %s lost per-variant checksums: %+v", id, note)
+		}
+	}
+	secondNote, err := reopened.ReleaseNote(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondNote.ParentID != first.ID || secondNote.WithdrawnID != "" {
+		t.Fatalf("second decision lost parent relation: %+v", secondNote)
+	}
+	withdrawnNote, err := reopened.ReleaseNote(withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withdrawnNote.ParentID != second.ID || withdrawnNote.WithdrawnID != second.ID {
+		t.Fatalf("withdrawal decision lost parent/withdrawn relation: %+v", withdrawnNote)
+	}
+	afterReopen, err := reopened.CompareReleases(first.ID, withdrawn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterReopen.Ranges) != 0 {
+		t.Fatalf("withdrawn content differs from its adopted parent: %+v", afterReopen.Ranges)
+	}
+
+	currentViewer, currentIndex, err := player.OpenStream(store.Open(root), "news", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer currentViewer.Close()
+	if currentIndex.ID != current.ID {
+		t.Fatalf("current publication=%s, want %s", currentIndex.ID, current.ID)
+	}
+	if _, err := reopened.ReleaseNote(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.CompareReleases(original.ID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	origin, content, err := currentViewer.AdoptedReleaseID("base", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOrigin := publisher.VersionID(8)
+	if origin != wantOrigin || content.AdoptedFrom != wantOrigin {
+		t.Fatalf("current adoption origin=%s adopted_from=%s, want %s", origin, content.AdoptedFrom, wantOrigin)
+	}
+	if currentViewer.Publication() != current.ID {
+		t.Fatalf("historical query changed current player to %s", currentViewer.Publication())
+	}
+	if _, err := os.Stat(filepath.Join(root, "publish", "versions", second.ID, "release.json")); !os.IsNotExist(err) {
+		t.Fatalf("reclaimed version still contains release.json, err=%v", err)
+	}
+}
+
+func TestPublisherMigratesLegacyVersionReleaseNotes(t *testing.T) {
+	root := t.TempDir()
+	publisher, err := live.NewPublisher(root, "news", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := publisher.PublishNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(root, "publish", "versions", published.ID, store.ReleaseNoteName)
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "publish", "decisions", published.ID+".json"), legacyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(root, "publish", "decisions")); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := live.NewPublisher(root, "news", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	note, err := reopened.ReleaseNote(published.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note.ID != published.ID || note.Kind != store.ReleasePublish || len(note.Changes) != len(media.Variants) {
+		t.Fatalf("legacy decision migration lost metadata: %+v", note)
+	}
+}
 
 func TestCorrectionReleaseNotesContinuousComparisonWithdrawalAndReopen(t *testing.T) {
 	root := t.TempDir()
